@@ -24,8 +24,9 @@
     margin-top: 14px;
     width: 100%;
     height: 14px;
-    background: #eceef1;
-    border-radius: 8px;
+    background: var(--panel-2, #1e293b);
+    border: 1px solid var(--border, #263349);
+    border-radius: 999px;
     overflow: hidden;
   }
   .progress-bar {
@@ -33,7 +34,7 @@
     width: 0%;
     background: linear-gradient(90deg, #3b82f6, #6366f1);
     background-size: 200% 100%;
-    border-radius: 8px;
+    border-radius: 999px;
     /* Плавное перетекание при собственном «подкрадывании» прогресса. */
     transition: width .25s linear;
     animation: barflow 2s linear infinite;
