@@ -36,6 +36,7 @@ in ``.env``) and can be overridden via :func:`run_bot`.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,11 @@ class _Job:
     user_id: int
     status_message_id: int
     query: str
+    # Уникальный id задачи для кнопки «Отмена» (callback_data cancel:{id}).
+    job_id: int = 0
+    # Флаг отмены: worker пропустит задачу, ещё не начавшую (или уже
+    # выполняющуюся) обработку — результат просто не будет отправлен.
+    cancelled: bool = False
 
 
 def _find_report(run_dir: Path) -> Optional[Path]:
@@ -84,6 +90,7 @@ def _run_pipeline_blocking(
     sources: Optional[List[str]],
     top_papers: int,
     search_limit: int,
+    progress_fn=None,
 ) -> Path:
     """Blocking pipeline call (executed in a thread executor)."""
 
@@ -96,6 +103,7 @@ def _run_pipeline_blocking(
         # without an LLM provider.
         use_llm_for_hypotheses=True,
         generate_report=True,
+        progress_fn=progress_fn,
     )
 
 
@@ -133,6 +141,15 @@ def build_bot_app(
     # Пользователи, от которых бот сейчас ждёт число вместо поискового запроса.
     # user_id -> "search_limit" | "top_papers".
     awaiting_number: Dict[int, str] = {}
+
+    # Активные задачи по job_id (для кнопки «Отмена»). Задача удаляется отсюда,
+    # когда обработка окончательно завершилась (успех/ошибка/отмена).
+    jobs_by_id: Dict[int, _Job] = {}
+    _job_counter = {"n": 0}
+
+    def _next_job_id() -> int:
+        _job_counter["n"] += 1
+        return _job_counter["n"]
 
     # ------------------------------------------------------------------ helpers
     def _settings_keyboard(s: UserSettings) -> "InlineKeyboardMarkup":
@@ -272,17 +289,57 @@ def build_bot_app(
                 db.ensure_tg_user(user_id, message.from_user.username)
             except Exception:  # pragma: no cover - best-effort
                 pass
+        job_id = _next_job_id()
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel:{job_id}")]
+            ]
+        )
         status = await message.answer(
-            "Принял запрос в очередь. Обрабатываю — это может занять несколько минут…"
+            "Принял запрос в очередь. Обрабатываю — это может занять несколько минут…",
+            reply_markup=cancel_kb,
         )
-        await queue.put(
-            _Job(
-                chat_id=message.chat.id,
-                user_id=user_id,
-                status_message_id=status.message_id,
-                query=text,
-            )
+        job = _Job(
+            chat_id=message.chat.id,
+            user_id=user_id,
+            status_message_id=status.message_id,
+            query=text,
+            job_id=job_id,
         )
+        jobs_by_id[job_id] = job
+        await queue.put(job)
+
+    # ------------------------------------------------------------- cancel button
+    @dp.callback_query(F.data.startswith("cancel:"))
+    async def _cancel_job(cb: "CallbackQuery") -> None:
+        raw = cb.data.split(":", 1)[1]
+        try:
+            job_id = int(raw)
+        except ValueError:
+            await cb.answer("Некорректный запрос.")
+            return
+        job = jobs_by_id.get(job_id)
+        if job is None:
+            # Уже завершена/отправлена — отменять нечего.
+            await cb.answer("Запрос уже завершён — отменять нечего.")
+            try:
+                if cb.message is not None:
+                    await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:  # pragma: no cover - best-effort
+                pass
+            return
+        job.cancelled = True
+        # Помечаем общий запуск отменённым (чтобы и на сайте не «висел»).
+        try:
+            db.update_run_job(f"bot-{job_id}", status="error", stage="Отменено")
+        except Exception:  # pragma: no cover - best-effort
+            pass
+        await cb.answer("Отменяю…")
+        try:
+            if cb.message is not None:
+                await cb.message.edit_text("❌ Запрос отменён.")
+        except Exception:  # pragma: no cover - best-effort
+            pass
 
     # ----------------------------------------------------------------- commands
     @dp.message(CommandStart())
@@ -448,13 +505,80 @@ def build_bot_app(
         await _enqueue_query(message, text)
 
     # ------------------------------------------------------------- job pipeline
+    def _bar(fraction: float) -> str:
+        """Текстовый прогресс-бар из 10 блоков для статус-сообщения бота."""
+
+        frac = max(0.0, min(1.0, float(fraction)))
+        filled = int(round(frac * 10))
+        return "▰" * filled + "▱" * (10 - filled) + f" {int(round(frac * 100))}%"
+
     async def _process_job(job: _Job) -> None:
         from aiogram.types import FSInputFile
+
+        # Отмена ещё до старта обработки (задача стояла в очереди).
+        if job.cancelled:
+            return
 
         loop = asyncio.get_running_loop()
         user = db.get_settings(job.user_id)
         sources_csv = user.sources_csv()
         sources_list = None if sources_csv == "all" else sources_csv.split(",")
+
+        # Общий id запуска для таблицы run_jobs (прогресс виден и на сайте).
+        run_job_id = f"bot-{job.job_id}"
+        try:
+            db.create_run_job(run_job_id, job.user_id, job.query)
+        except Exception:  # pragma: no cover - best-effort
+            logger.debug("create_run_job failed for %s", run_job_id, exc_info=True)
+
+        # Кнопка «Отмена» для статус-сообщения (обновляем вместе с прогрессом).
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отмена", callback_data=f"cancel:{job.job_id}"
+                    )
+                ]
+            ]
+        )
+
+        # Троттлинг правок статус-сообщения: не чаще, чем раз в ~2.5 c.
+        last_edit = {"t": 0.0, "text": ""}
+
+        def _on_progress(label: str, frac: float) -> None:
+            """Колбэк пайплайна (вызывается из рабочего потока)."""
+
+            # 1) Зеркалим в общую БД (для сайта). Best-effort, синхронно.
+            try:
+                db.update_run_job(run_job_id, stage=label, progress=frac)
+            except Exception:  # pragma: no cover
+                pass
+            # 2) Раз в несколько секунд правим статус-сообщение в Telegram.
+            now = time.monotonic()
+            if now - last_edit["t"] < 2.5:
+                return
+            text = f"⏳ {label}\n{_bar(frac)}"
+            if text == last_edit["text"]:
+                return
+            last_edit["t"] = now
+            last_edit["text"] = text
+            coro = bot.edit_message_text(
+                text,
+                chat_id=job.chat_id,
+                message_id=job.status_message_id,
+                reply_markup=cancel_kb,
+            )
+            # Правку шлём в event loop из рабочего потока (fire-and-forget).
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+
+            def _swallow(f):  # редактирование best-effort, ошибки глушим
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+            fut.add_done_callback(_swallow)
+
         try:
             run_dir = await loop.run_in_executor(
                 None,
@@ -463,18 +587,36 @@ def build_bot_app(
                     sources=sources_list,
                     top_papers=user.top_papers,
                     search_limit=user.search_limit,
+                    progress_fn=_on_progress,
                 ),
             )
         except Exception as e:  # pragma: no cover - runtime failure path
             logger.exception("Pipeline failed for query=%r", job.query)
+            try:
+                db.update_run_job(run_job_id, status="error", stage="Ошибка")
+            except Exception:
+                pass
             await bot.send_message(
                 job.chat_id,
                 f"Не удалось обработать запрос: {type(e).__name__}: {e}",
             )
             return
 
+        # Пользователь мог нажать «Отмена», пока пайплайн работал в потоке.
+        # Остановить сам поток нельзя, но результат уже не отправляем.
+        if job.cancelled:
+            try:
+                db.update_run_job(run_job_id, status="error", stage="Отменено")
+            except Exception:
+                pass
+            return
+
         report = _find_report(Path(run_dir))
         if report is None:
+            try:
+                db.update_run_job(run_job_id, status="error", stage="Отчёт не создан")
+            except Exception:
+                pass
             await bot.send_message(
                 job.chat_id,
                 "Пайплайн завершился, но HTML-отчёт не был создан "
@@ -485,9 +627,11 @@ def build_bot_app(
         # Сохраняем отчёт в историю (BLOB), чтобы /story работал даже без runs/.
         # Заодно готовим публичную ссылку на HTML-версию на сайте (по токену).
         share_url: Optional[str] = None
+        saved_report_id: Optional[int] = None
         try:
             html_bytes = report.read_bytes()
             report_id = db.add_report(job.user_id, job.query, html_bytes)
+            saved_report_id = report_id
             try:
                 token = db.create_report_share(report_id)
                 base = (settings.web_base_url or "").rstrip("/")
@@ -497,6 +641,18 @@ def build_bot_app(
                 logger.exception("Failed to create share link for %r", job.query)
         except Exception:  # pragma: no cover - history is best-effort
             logger.exception("Failed to store report in history for %r", job.query)
+
+        # Помечаем общий запуск завершённым (для сайта: 100% + ссылка на отчёт).
+        try:
+            db.update_run_job(
+                run_job_id,
+                status="done",
+                stage="Готово",
+                progress=1.0,
+                report_id=saved_report_id,
+            )
+        except Exception:  # pragma: no cover
+            pass
 
         link_line = f"\n\n🔗 Открыть на сайте: {share_url}" if share_url else ""
 
@@ -546,6 +702,9 @@ def build_bot_app(
             try:
                 await _process_job(job)
             finally:
+                # Задача завершена (успех/ошибка/отмена) — снимаем с учёта,
+                # чтобы кнопка «Отмена» больше не срабатывала.
+                jobs_by_id.pop(job.job_id, None)
                 queue.task_done()
 
     async def _on_startup() -> None:

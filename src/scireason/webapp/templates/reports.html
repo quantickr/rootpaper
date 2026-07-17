@@ -2,13 +2,18 @@
 {% block title %}Мои отчёты{% endblock %}
 {% block content %}
 <div class="card">
-  <h1>Мои отчёты <span class="muted">({{ total }})</span></h1>
+  <h1>Мои отчёты <span class="muted">(<span id="total">{{ total }}</span>)</span></h1>
+
+  <!-- Активные запуски (в т.ч. запущенные из Telegram). Заполняется JS. -->
+  <div id="active-runs"></div>
+
+  <div id="reports-body">
   {% if items %}
   <table>
     <thead>
       <tr><th>Дата</th><th>Запрос</th><th>Источник</th><th>Размер</th><th></th></tr>
     </thead>
-    <tbody>
+    <tbody id="reports-tbody">
       {% for it in items %}
       <tr>
         <td class="muted">{{ it.when }}</td>
@@ -35,5 +40,94 @@
   {% else %}
   <p class="muted">Пока нет отчётов. <a href="/run">Запустите первый запрос</a>.</p>
   {% endif %}
+  </div>
 </div>
+
+<style>
+  .runrow {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 12px; margin-bottom: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .runrow .q { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .runrow .rbar { flex: 0 0 140px; height: 10px; background: #eceef1; border-radius: 6px; overflow: hidden; }
+  .runrow .rbar > i { display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg,#3b82f6,#6366f1); transition: width .3s linear; }
+  .runrow .rpct { flex: 0 0 40px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .runrow .rstage { flex: 0 0 auto; color: var(--muted); font-size: 13px; }
+  tr.fresh { animation: flash 1.4s ease-out; }
+  @keyframes flash { from { background: rgba(59,130,246,.28); } to { background: transparent; } }
+</style>
+
+<script>
+const page = {{ page }};
+const totalEl = document.getElementById("total");
+const activeEl = document.getElementById("active-runs");
+let tbody = document.getElementById("reports-tbody");
+
+// Известные id отчётов (чтобы подсветить новые строки при появлении).
+let knownIds = new Set(
+  Array.from(tbody ? tbody.querySelectorAll("a[href^='/reports/']") : [])
+    .map(a => (a.getAttribute("href").match(/\/reports\/(\d+)\//) || [])[1])
+    .filter(Boolean)
+);
+let prevActive = 0;
+
+function esc(s) {
+  const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML;
+}
+
+function renderActive(active) {
+  if (!active || active.length === 0) { activeEl.innerHTML = ""; return; }
+  activeEl.innerHTML = active.map(j => {
+    const pct = Math.round((j.progress || 0) * 100);
+    return `<div class="runrow">
+      <span class="q">⏳ ${esc(j.query)} <span class="pill">${esc(j.origin)}</span></span>
+      <span class="rstage">${esc(j.stage || "")}</span>
+      <span class="rbar"><i style="width:${pct}%"></i></span>
+      <span class="rpct">${pct}%</span>
+    </div>`;
+  }).join("");
+}
+
+function renderRows(items) {
+  if (!tbody) {
+    // Раньше отчётов не было — при первом появлении перезагрузим страницу,
+    // чтобы отрисовать полноценную таблицу с шапкой и пагинацией.
+    if (items && items.length) location.reload();
+    return;
+  }
+  tbody.innerHTML = items.map(it => {
+    const isNew = !knownIds.has(String(it.id));
+    return `<tr class="${isNew ? 'fresh' : ''}">
+      <td class="muted">${esc(it.when)}</td>
+      <td>${esc(it.query)}</td>
+      <td><span class="pill">${esc(it.origin)}</span></td>
+      <td class="muted">${esc(it.size_kb)} КБ</td>
+      <td>
+        <a href="/reports/${it.id}/view" target="_blank">Открыть</a>
+        &nbsp;·&nbsp;
+        <a href="/reports/${it.id}/download">Скачать</a>
+      </td>
+    </tr>`;
+  }).join("");
+  knownIds = new Set(items.map(it => String(it.id)));
+}
+
+async function poll() {
+  try {
+    const r = await fetch(`/reports/state?page=${page}`);
+    if (r.ok) {
+      const j = await r.json();
+      if (totalEl) totalEl.textContent = j.total;
+      renderActive(j.active);
+      // Обновляем таблицу только на первой странице (там появляются новые).
+      if (page === 1) renderRows(j.items);
+      prevActive = (j.active || []).length;
+    }
+  } catch (e) { /* тихо повторим */ }
+  setTimeout(poll, 4000);
+}
+poll();
+</script>
 {% endblock %}

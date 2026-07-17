@@ -70,6 +70,26 @@ class ReportRow:
 
 
 @dataclass
+class RunJobRow:
+    """Строка общего прогресса запуска (сайт и бот пишут в ``run_jobs``).
+
+    Позволяет сайту показывать прогресс тем, запущенных из Telegram, и
+    обновлять список отчётов без ручной перезагрузки страницы.
+    """
+
+    id: str
+    owner_id: int
+    query: str
+    origin: str  # "web" | "bot"
+    status: str  # "running" | "done" | "error"
+    stage: str
+    progress: float  # 0.0–1.0
+    report_id: Optional[int]
+    created_at: float
+    updated_at: float
+
+
+@dataclass
 class User:
     """Пользователь сайта."""
 
@@ -261,6 +281,33 @@ class Store(ABC):
     @abstractmethod
     def get_report_html_by_share(self, token: str) -> Optional[bytes]:
         """HTML отчёта по публичному share-токену (без проверки владельца)."""
+
+    # --------------------------------------------------------------- run jobs
+    @abstractmethod
+    def create_run_job(
+        self, job_id: str, owner_id: int, query: str, *, origin: str = "web"
+    ) -> None:
+        """Зарегистрировать новый запуск (статус running, progress 0)."""
+
+    @abstractmethod
+    def update_run_job(
+        self,
+        job_id: str,
+        *,
+        status: Optional[str] = None,
+        stage: Optional[str] = None,
+        progress: Optional[float] = None,
+        report_id: Optional[int] = None,
+    ) -> None:
+        """Обновить прогресс/статус запуска (частичное обновление)."""
+
+    @abstractmethod
+    def get_run_job(self, job_id: str) -> Optional[RunJobRow]:
+        """Одна строка прогресса по её id (или None)."""
+
+    @abstractmethod
+    def list_active_run_jobs(self, owner_id: int) -> List[RunJobRow]:
+        """Незавершённые запуски владельца (status='running')."""
 
     # ------------------------------------------------------------- stats
     @abstractmethod

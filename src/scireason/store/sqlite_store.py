@@ -22,6 +22,7 @@ from .base import (
     ROLE_USER,
     EmailToken,
     ReportRow,
+    RunJobRow,
     Store,
     User,
     UserSettings,
@@ -94,12 +95,30 @@ class SqliteStore(Store):
                     created_at REAL    NOT NULL
                 );
 
+                -- Общий прогресс запусков (сайт И бот пишут сюда). Позволяет
+                -- показывать на сайте прогресс тем, запущенных из Telegram, и
+                -- обновлять список отчётов без ручной перезагрузки страницы.
+                CREATE TABLE IF NOT EXISTS run_jobs (
+                    id         TEXT    PRIMARY KEY,
+                    owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    query      TEXT    NOT NULL,
+                    origin     TEXT    NOT NULL DEFAULT 'web',
+                    status     TEXT    NOT NULL DEFAULT 'running',
+                    stage      TEXT    NOT NULL DEFAULT '',
+                    progress   REAL    NOT NULL DEFAULT 0.0,
+                    report_id  INTEGER,
+                    created_at REAL    NOT NULL,
+                    updated_at REAL    NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_reports_owner
                     ON reports (owner_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tokens_user
                     ON email_tokens (user_id);
                 CREATE INDEX IF NOT EXISTS idx_shares_report
                     ON report_shares (report_id);
+                CREATE INDEX IF NOT EXISTS idx_runjobs_owner
+                    ON run_jobs (owner_id, updated_at DESC);
                 """
             )
 
@@ -473,6 +492,81 @@ class SqliteStore(Store):
         if row is None:
             return None
         return bytes(row["html"])
+
+    # --------------------------------------------------------------- run jobs
+    def _row_to_run_job(self, row: sqlite3.Row) -> RunJobRow:
+        return RunJobRow(
+            id=str(row["id"]),
+            owner_id=int(row["owner_id"]),
+            query=str(row["query"]),
+            origin=str(row["origin"]),
+            status=str(row["status"]),
+            stage=str(row["stage"]),
+            progress=float(row["progress"]),
+            report_id=int(row["report_id"]) if row["report_id"] is not None else None,
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def create_run_job(
+        self, job_id: str, owner_id: int, query: str, *, origin: str = "web"
+    ) -> None:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_jobs
+                    (id, owner_id, query, origin, status, stage, progress,
+                     report_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'running', '', 0.0, NULL, ?, ?)
+                """,
+                (job_id, int(owner_id), query, origin, now, now),
+            )
+
+    def update_run_job(
+        self,
+        job_id: str,
+        *,
+        status: Optional[str] = None,
+        stage: Optional[str] = None,
+        progress: Optional[float] = None,
+        report_id: Optional[int] = None,
+    ) -> None:
+        sets: List[str] = ["updated_at = ?"]
+        params: List[object] = [time.time()]
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if stage is not None:
+            sets.append("stage = ?")
+            params.append(stage)
+        if progress is not None:
+            sets.append("progress = ?")
+            params.append(max(0.0, min(1.0, float(progress))))
+        if report_id is not None:
+            sets.append("report_id = ?")
+            params.append(int(report_id))
+        params.append(job_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE run_jobs SET {', '.join(sets)} WHERE id = ?", params
+            )
+
+    def get_run_job(self, job_id: str) -> Optional[RunJobRow]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._row_to_run_job(row) if row is not None else None
+
+    def list_active_run_jobs(self, owner_id: int) -> List[RunJobRow]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM run_jobs WHERE owner_id = ? AND status = 'running' "
+                "ORDER BY updated_at DESC",
+                (int(owner_id),),
+            ).fetchall()
+        return [self._row_to_run_job(r) for r in rows]
 
     # ------------------------------------------------------------------- stats
     def stats_global(self) -> dict:

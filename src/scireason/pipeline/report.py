@@ -392,6 +392,9 @@ def build_summary_graph(
     for r in items:
         pid = str(r["id"])
         order = order_by_id.get(pid, 0)
+        # Аннотируем сам record порядком изучения (in-place), чтобы основной
+        # список статей в отчёте можно было отсортировать «по порядку изучения».
+        r["study_order"] = order
         base_title = r.get("title", "")
         nodes.append(
             {
@@ -435,6 +438,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .papers {{ max-height:620px; overflow-y:auto; padding:8px 12px; }}
   .paper {{ border:1px solid var(--border); border-radius:8px; margin:10px 0; padding:12px 14px; background:#12151c; }}
   .paper .ptitle {{ font-weight:600; font-size:14px; margin-bottom:6px; }}
+  .paper .order-badge {{ display:inline-block; min-width:20px; height:20px; line-height:20px;
+    text-align:center; padding:0 5px; margin-right:4px; border-radius:10px;
+    background:linear-gradient(90deg,#3b82f6,#6366f1); color:#fff; font-size:12px; font-weight:700; }}
   .paper .summary {{ color:var(--text); font-size:13px; line-height:1.5; }}
   .paper .sub {{ color:var(--muted); font-size:12px; margin-top:6px; }}
   details {{ margin-top:8px; }}
@@ -480,7 +486,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="graph"></div>
   </div>
   <div class="card">
-    <h2 style="padding:12px 16px;border-bottom:1px solid var(--border)">Статьи &middot; {n_papers}</h2>
+    <h2 style="padding:12px 16px;border-bottom:1px solid var(--border)">Статьи &middot; {n_papers}
+      <span style="font-weight:400;font-size:12px;color:var(--muted)">— по порядку изучения</span></h2>
     <div class="search"><input id="paperSearch" placeholder="Фильтр по названию или саммари\u2026"/></div>
     <div class="papers" id="papers"></div>
   </div>
@@ -550,8 +557,10 @@ const PAPERS = {papers_json};
       if (p.url) links.push('<a href="' + esc(p.url) + '" target="_blank" rel="noopener">Источник</a>');
       if (p.pdf_url) links.push('<a href="' + esc(p.pdf_url) + '" target="_blank" rel="noopener">PDF</a>');
       if (p.doi) links.push('<a href="https://doi.org/' + esc(p.doi) + '" target="_blank" rel="noopener">DOI</a>');
+      const ord = (p.study_order != null && p.study_order > 0)
+        ? '<span class="order-badge">' + p.study_order + '</span> ' : '';
       el.innerHTML =
-        '<div class="ptitle">' + esc(p.title) + '</div>' +
+        '<div class="ptitle">' + ord + esc(p.title) + '</div>' +
         '<div class="summary">' + esc(p.summary) + '</div>' +
         (sub ? '<div class="sub">' + sub + '</div>' : '') +
         '<details><summary>Разобрать статью</summary><div class="detail-body">' +
@@ -687,10 +696,16 @@ def write_run_report(
     )
 
     # Persist the paper-similarity ("summarization") graph as a data artifact.
+    # Побочный эффект: build_summary_graph аннотирует каждый record полем
+    # ``study_order`` (1..N) — рекомендованным порядком изучения.
     summary_graph = build_summary_graph(records)
     (out_dir / "summary_graph.json").write_text(
         json.dumps(summary_graph, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Сортируем основной список статей по порядку изучения: от обзорных/базовых
+    # (1) к более узким (N). Записи без порядка уезжают в конец.
+    records.sort(key=lambda r: (r.get("study_order") or 10_000))
 
     report_path = out_dir / "report.html"
     report_path.write_text(

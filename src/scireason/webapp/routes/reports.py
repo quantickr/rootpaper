@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ...store.base import ALL_SOURCES
 from ..deps import current_user, get_db, render
@@ -56,6 +56,47 @@ def reports_list(request: Request, page: int = Query(1, ge=1)):
         page=page,
         pages=pages,
     )
+
+
+@router.get("/reports/state")
+def reports_state(request: Request, page: int = Query(1, ge=1)):
+    """JSON для авто-обновления: активные запуски + текущая страница отчётов.
+
+    Страница «Мои отчёты» опрашивает этот эндпоинт, поэтому новые отчёты (в т.ч.
+    запущенные из Telegram) и прогресс активных тем появляются без ручной
+    перезагрузки.
+    """
+
+    user = current_user(request)
+    if user is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = get_db()
+    total = db.count_reports(user.id)
+    offset = (page - 1) * _PAGE_SIZE
+    rows = db.list_reports(user.id, offset=offset, limit=_PAGE_SIZE)
+    items = [
+        {
+            "id": r.id,
+            "query": r.query,
+            "when": datetime.fromtimestamp(r.created_at).strftime("%Y-%m-%d %H:%M"),
+            "size_kb": round(r.size_bytes / 1024, 1),
+            "origin": r.origin,
+        }
+        for r in rows
+    ]
+    active = [
+        {
+            "id": j.id,
+            "query": j.query,
+            "origin": j.origin,
+            "stage": j.stage,
+            "progress": round(j.progress, 4),
+            "status": j.status,
+            "report_id": j.report_id,
+        }
+        for j in db.list_active_run_jobs(user.id)
+    ]
+    return JSONResponse({"total": total, "items": items, "active": active})
 
 
 @router.get("/reports/{report_id}/view", response_class=HTMLResponse)

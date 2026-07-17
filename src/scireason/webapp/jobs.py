@@ -67,6 +67,20 @@ class JobManager:
             job.stage = label
             # Прогресс не должен уменьшаться и держится ниже 100% до статуса done.
             job.progress = max(job.progress, min(0.99, float(fraction)))
+            stage, progress = job.stage, job.progress
+        # Зеркалим прогресс в общую БД (вне лока), чтобы сайт мог показывать
+        # прогресс и авто-обновлять список отчётов.
+        self._mirror(job.id, stage=stage, progress=progress)
+
+    def _mirror(self, job_id: str, **fields) -> None:
+        """Best-effort зеркалирование состояния задачи в общую таблицу run_jobs."""
+
+        try:
+            from ..store import get_store
+
+            get_store().update_run_job(job_id, **fields)
+        except Exception:  # pragma: no cover - зеркало не должно ронять пайплайн
+            logger.debug("run_jobs mirror failed for %s", job_id, exc_info=True)
 
     # ------------------------------------------------------------------ worker
     def _run(self, job_id: str) -> None:
@@ -80,6 +94,11 @@ class JobManager:
         job.progress = 0.02
         job.stage = "Запускаю обработку…"
         db = get_store()
+        # Регистрируем запуск в общей БД (best-effort).
+        try:
+            db.create_run_job(job.id, job.owner_id, job.query, origin="web")
+        except Exception:  # pragma: no cover
+            logger.debug("create_run_job failed for %s", job.id, exc_info=True)
         settings = db.get_settings(job.owner_id)
         sources_csv = settings.sources_csv()
         sources = None if sources_csv == "all" else sources_csv.split(",")
@@ -97,12 +116,14 @@ class JobManager:
             logger.exception("Web pipeline failed for %r", job.query)
             job.status = "error"
             job.message = f"{type(e).__name__}: {e}"
+            self._mirror(job.id, status="error", stage=job.message)
             return
 
         report = Path(run_dir) / "report.html"
         if not report.exists():
             job.status = "error"
             job.message = "Отчёт не создан (возможно, ничего не найдено)."
+            self._mirror(job.id, status="error", stage=job.message)
             return
         try:
             html = report.read_bytes()
@@ -112,10 +133,14 @@ class JobManager:
             job.progress = 1.0
             job.stage = "Готово"
             job.message = "Готово."
+            self._mirror(
+                job.id, status="done", stage="Готово", progress=1.0, report_id=rid
+            )
         except Exception as e:  # pragma: no cover
             logger.exception("Failed to store web report for %r", job.query)
             job.status = "error"
             job.message = f"Не удалось сохранить отчёт: {e}"
+            self._mirror(job.id, status="error", stage="Ошибка сохранения")
 
 
 _manager: Optional[JobManager] = None

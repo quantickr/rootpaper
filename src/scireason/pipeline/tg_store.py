@@ -117,3 +117,17 @@ class TgStore:
         """Публичный share-токен отчёта для ссылки на сайт (из бота)."""
 
         return self._store.create_report_share(report_id)
+
+    # ------------------------------------------------------------------ run jobs
+    def owner_id_for(self, user_id: int, tg_username: Optional[str] = None) -> int:
+        """Внутренний owner_id по Telegram user_id (для общего прогресса)."""
+
+        return self._owner_id(user_id, tg_username)
+
+    def create_run_job(self, job_id: str, user_id: int, query: str) -> None:
+        self._store.create_run_job(
+            job_id, self._owner_id(user_id), query, origin="bot"
+        )
+
+    def update_run_job(self, job_id: str, **kwargs) -> None:
+        self._store.update_run_job(job_id, **kwargs)
