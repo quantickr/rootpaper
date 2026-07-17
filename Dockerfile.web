@@ -56,8 +56,17 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install argostranslate pymupdf langdetect fasttext-wheel
 
 # Предзагрузка моделей перевода и детектора языка (идемпотентно, офлайн-безопасно).
-RUN python scripts/preload_argos.py
-RUN python scripts/preload_fasttext_lid.py
+# По умолчанию ОТКЛЮЧЕНА: на слабых VM (2 CPU / <4 ГБ) скачивание+распаковка
+# argos-пакетов вызывает OOM во время сборки. Модели скачаются лениво при первом
+# запуске пайплайна (том /app/.cache сохраняет их между перезапусками).
+# Включить предзагрузку в образ: docker build --build-arg PRELOAD_MODELS=1 ...
+ARG PRELOAD_MODELS=0
+RUN if [ "$PRELOAD_MODELS" = "1" ]; then \
+        python scripts/preload_argos.py && \
+        python scripts/preload_fasttext_lid.py; \
+    else \
+        echo "Skipping model preload (PRELOAD_MODELS=$PRELOAD_MODELS); models load lazily at first run."; \
+    fi
 
 # Тома для персистентности:
 #  - /app/runs   : результаты пайплайна + SQLite (если не Postgres);
