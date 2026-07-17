@@ -174,6 +174,28 @@ class Store(ABC):
     def consume_email_token(self, token: str, *, purpose: str) -> Optional[int]:
         """Проверить токен, удалить его и вернуть ``user_id`` при успехе."""
 
+    @abstractmethod
+    def create_email_code(
+        self, user_id: int, *, purpose: str, ttl_seconds: int
+    ) -> EmailToken:
+        """Создать 6-значный числовой код для ``user_id`` и ``purpose``.
+
+        Старые коды этого пользователя с тем же ``purpose`` удаляются, поэтому
+        активным всегда остаётся один код. В отличие от
+        :meth:`create_email_token`, значение — это короткий 6-значный код,
+        поэтому проверять его нужно вместе с ``user_id`` (см.
+        :meth:`consume_email_code`).
+        """
+
+    @abstractmethod
+    def consume_email_code(
+        self, user_id: int, code: str, *, purpose: str
+    ) -> bool:
+        """Проверить код для ``user_id``+``purpose``, удалить его и вернуть True.
+
+        Возвращает False, если код неверный, с другим ``purpose`` или истёк.
+        """
+
     # ------------------------------------------------------------- settings
     @abstractmethod
     def get_settings(self, owner_id: int) -> UserSettings:

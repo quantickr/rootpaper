@@ -21,7 +21,7 @@ from ..deps import (
     render,
     set_session_cookie,
 )
-from ..email_utils import send_verification_email
+from ..email_utils import send_password_reset_code, send_verification_code
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -75,44 +75,81 @@ def register_submit(
         email_verified=False,
     )
 
-    token = db.create_email_token(
+    code = db.create_email_code(
         user.id, purpose="verify", ttl_seconds=settings.email_verify_ttl_seconds
     )
-    verify_url = f"{settings.web_base_url.rstrip('/')}/verify?token={token.token}"
-    sent = send_verification_email(email, verify_url)
+    sent = send_verification_code(email, code.token)
 
-    msg = (
-        "Регистрация почти завершена. Мы отправили ссылку подтверждения на "
-        f"{email}. Проверьте почту."
+    return render(
+        request,
+        "verify_code.html",
+        email=email,
+        sent=sent,
+        info=(
+            f"Мы отправили 6-значный код подтверждения на {email}. "
+            "Введите его ниже."
+        ),
     )
-    if not sent:
-        msg += (
-            " (SMTP не настроен — ссылка выведена в лог сервера; "
-            "перейдите по ней вручную.)"
-        )
-    return render(request, "message.html", title="Проверьте почту", message=msg)
 
 
+# ------------------------------------------------------------- email code verify
 @router.get("/verify")
-def verify_email(request: Request, token: str = ""):
+def verify_form(request: Request, email: str = ""):
+    return render(request, "verify_code.html", email=email.strip().lower())
+
+
+@router.post("/verify")
+def verify_submit(
+    request: Request,
+    email: str = Form(...),
+    code: str = Form(...),
+):
     db = get_db()
-    uid = db.consume_email_token(token, purpose="verify") if token else None
-    if uid is None:
+    email = email.strip().lower()
+    code = (code or "").strip()
+    user = db.get_user_by_email(email)
+    if user is None:
         return render(
             request,
-            "message.html",
-            title="Ссылка недействительна",
-            message="Ссылка подтверждения неверна или устарела. "
-            "Зарегистрируйтесь заново или запросите новую.",
+            "verify_code.html",
+            email=email,
+            error="Аккаунт не найден. Зарегистрируйтесь заново.",
         )
-    user = db.get_user(uid)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
+    if user.email_verified:
+        resp = RedirectResponse("/reports", status_code=303)
+        set_session_cookie(resp, user.id)
+        return resp
+    if not db.consume_email_code(user.id, code, purpose="verify"):
+        return render(
+            request,
+            "verify_code.html",
+            email=email,
+            error="Неверный или устаревший код. Проверьте код или запросите новый.",
+        )
     user.email_verified = True
     db.update_user(user)
     resp = RedirectResponse("/reports", status_code=303)
     set_session_cookie(resp, user.id)
     return resp
+
+
+@router.post("/verify/resend")
+def verify_resend(request: Request, email: str = Form(...)):
+    db = get_db()
+    email = email.strip().lower()
+    user = db.get_user_by_email(email)
+    if user is not None and not user.email_verified:
+        code = db.create_email_code(
+            user.id, purpose="verify", ttl_seconds=settings.email_verify_ttl_seconds
+        )
+        send_verification_code(email, code.token)
+    # Нейтральное сообщение независимо от наличия аккаунта.
+    return render(
+        request,
+        "verify_code.html",
+        email=email,
+        info="Если аккаунт существует и не подтверждён, мы отправили новый код.",
+    )
 
 
 # ------------------------------------------------------------------------ login
@@ -137,11 +174,16 @@ def login_submit(
             request, "login.html", error="Неверный email или пароль.", email=email
         )
     if not user.email_verified:
+        # Отправим свежий код и сразу покажем форму ввода.
+        code = db.create_email_code(
+            user.id, purpose="verify", ttl_seconds=settings.email_verify_ttl_seconds
+        )
+        send_verification_code(email, code.token)
         return render(
             request,
-            "login.html",
-            error="Email не подтверждён. Проверьте почту (ссылка из письма).",
+            "verify_code.html",
             email=email,
+            info="Email не подтверждён. Мы отправили новый код на вашу почту.",
         )
     resp = RedirectResponse("/reports", status_code=303)
     set_session_cookie(resp, user.id)
@@ -152,6 +194,83 @@ def login_submit(
 def logout():
     resp = RedirectResponse("/login", status_code=303)
     clear_session_cookie(resp)
+    return resp
+
+
+# --------------------------------------------------------- password reset (forgot)
+# Нейтральное сообщение, чтобы не раскрывать, существует ли аккаунт.
+_RESET_NEUTRAL = (
+    "Если аккаунт с таким email существует, мы отправили на него 6-значный "
+    "код для сброса пароля."
+)
+
+
+@router.get("/forgot")
+def forgot_form(request: Request):
+    if current_user(request):
+        return RedirectResponse("/reports", status_code=303)
+    return render(request, "forgot.html")
+
+
+@router.post("/forgot")
+def forgot_submit(request: Request, email: str = Form(...)):
+    db = get_db()
+    email = email.strip().lower()
+    if security.is_valid_email(email):
+        user = db.get_user_by_email(email)
+        if user is not None and user.email:
+            code = db.create_email_code(
+                user.id,
+                purpose="reset",
+                ttl_seconds=settings.email_verify_ttl_seconds,
+            )
+            send_password_reset_code(email, code.token)
+    # Всегда ведём на форму ввода кода с нейтральным сообщением.
+    return render(request, "reset.html", email=email, info=_RESET_NEUTRAL)
+
+
+@router.get("/reset")
+def reset_form(request: Request, email: str = ""):
+    if current_user(request):
+        return RedirectResponse("/reports", status_code=303)
+    return render(request, "reset.html", email=email.strip().lower())
+
+
+@router.post("/reset")
+def reset_submit(
+    request: Request,
+    email: str = Form(...),
+    code: str = Form(...),
+    password: str = Form(...),
+    password2: str = Form(...),
+):
+    db = get_db()
+    email = email.strip().lower()
+    code = (code or "").strip()
+
+    if password != password2:
+        return render(
+            request, "reset.html", email=email, error="Пароли не совпадают."
+        )
+    problem = security.password_problem(password)
+    if problem:
+        return render(request, "reset.html", email=email, error=problem)
+
+    user = db.get_user_by_email(email)
+    if user is None or not db.consume_email_code(user.id, code, purpose="reset"):
+        return render(
+            request,
+            "reset.html",
+            email=email,
+            error="Неверный или устаревший код. Запросите новый на странице «Забыли пароль?».",
+        )
+
+    user.password_hash = security.hash_password(password)
+    # Успешный сброс подтверждает владение почтой.
+    user.email_verified = True
+    db.update_user(user)
+    resp = RedirectResponse("/reports", status_code=303)
+    set_session_cookie(resp, user.id)
     return resp
 
 

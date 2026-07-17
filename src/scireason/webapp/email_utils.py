@@ -100,3 +100,84 @@ def send_verification_email(to_email: str, verify_url: str) -> bool:
         # Fallback: логируем ссылку, чтобы регистрация не была заблокирована.
         logger.warning("Ссылка подтверждения для %s: %s", to_email, verify_url)
         return False
+
+
+def _code_html(intro: str, code: str, note: str) -> str:
+    return (
+        f"<p>{intro}</p>"
+        '<p style="font-size:32px;font-weight:700;letter-spacing:6px;'
+        'font-family:monospace;color:#111;margin:18px 0">'
+        f"{code}</p>"
+        f'<p style="color:#666;font-size:13px">{note}</p>'
+    )
+
+
+def _send_code(
+    to_email: str,
+    *,
+    code: str,
+    subject: str,
+    intro: str,
+    note: str,
+    log_label: str,
+) -> bool:
+    """Общий помощник: отправить письмо с 6-значным кодом.
+
+    Возвращает True при успешной отправке. Если SMTP не настроен или отправка
+    не удалась — код пишется в лог (dev-fallback) и возвращается False.
+    """
+
+    text_body = f"{intro}\n\nКод: {code}\n\n{note}"
+    html_body = _code_html(intro, code, note)
+
+    if not smtp_enabled():
+        logger.warning(
+            "SMTP не настроен — письмо не отправлено. %s для %s: %s",
+            log_label,
+            to_email,
+            code,
+        )
+        return False
+
+    try:
+        _send_via_smtp(to_email, subject, text_body, html_body)
+        logger.info("Отправлено письмо (%s) на %s", log_label, to_email)
+        return True
+    except Exception:  # pragma: no cover - зависит от внешнего SMTP
+        logger.exception("Не удалось отправить письмо (%s) на %s", log_label, to_email)
+        logger.warning("%s для %s: %s", log_label, to_email, code)
+        return False
+
+
+def send_verification_code(to_email: str, code: str) -> bool:
+    """Отправить письмо с 6-значным кодом подтверждения email."""
+
+    return _send_code(
+        to_email,
+        code=code,
+        subject="Код подтверждения — RootPaper",
+        intro="Здравствуйте! Ваш код подтверждения регистрации на RootPaper:",
+        note=(
+            "Введите этот код на странице подтверждения. Код действует "
+            "ограниченное время. Если вы не регистрировались, "
+            "просто проигнорируйте это письмо."
+        ),
+        log_label="Код подтверждения",
+    )
+
+
+def send_password_reset_code(to_email: str, code: str) -> bool:
+    """Отправить письмо с 6-значным кодом для сброса пароля."""
+
+    return _send_code(
+        to_email,
+        code=code,
+        subject="Сброс пароля — RootPaper",
+        intro="Здравствуйте! Ваш код для сброса пароля на RootPaper:",
+        note=(
+            "Введите этот код на странице сброса пароля вместе с новым "
+            "паролем. Код действует ограниченное время. Если вы не запрашивали "
+            "сброс пароля, просто проигнорируйте это письмо — ваш пароль не изменится."
+        ),
+        log_label="Код сброса пароля",
+    )

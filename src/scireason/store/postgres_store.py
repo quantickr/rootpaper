@@ -262,6 +262,62 @@ class PostgresStore(Store):
                     return None
                 return int(row[0])
 
+    def create_email_code(
+        self, user_id: int, *, purpose: str, ttl_seconds: int
+    ) -> EmailToken:
+        now = time.time()
+        exp = now + ttl_seconds
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                # Оставляем один активный код на пользователя+назначение.
+                conn.execute(
+                    "DELETE FROM email_tokens WHERE user_id = %s AND purpose = %s",
+                    (user_id, purpose),
+                )
+                # token — PRIMARY KEY; 6-значный код должен быть уникальным среди
+                # активных токенов. ON CONFLICT DO NOTHING + проверка rowcount.
+                code = ""
+                for _ in range(50):
+                    code = f"{secrets.randbelow(1_000_000):06d}"
+                    cur = conn.execute(
+                        """
+                        INSERT INTO email_tokens
+                            (token, user_id, purpose, created_at, expires_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (token) DO NOTHING
+                        """,
+                        (code, user_id, purpose, now, exp),
+                    )
+                    if cur.rowcount:
+                        break
+                else:  # pragma: no cover - крайне маловероятно
+                    raise RuntimeError("Не удалось сгенерировать уникальный код")
+        return EmailToken(
+            token=code, user_id=user_id, purpose=purpose, created_at=now, expires_at=exp
+        )
+
+    def consume_email_code(
+        self, user_id: int, code: str, *, purpose: str
+    ) -> bool:
+        code = (code or "").strip()
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT expires_at FROM email_tokens "
+                    "WHERE user_id = %s AND token = %s AND purpose = %s FOR UPDATE",
+                    (user_id, code, purpose),
+                ).fetchone()
+                if row is None:
+                    return False
+                conn.execute(
+                    "DELETE FROM email_tokens "
+                    "WHERE user_id = %s AND token = %s AND purpose = %s",
+                    (user_id, code, purpose),
+                )
+                if float(row[0]) < time.time():
+                    return False
+                return True
+
     # ----------------------------------------------------------------- settings
     def get_settings(self, owner_id: int) -> UserSettings:
         with self._pool.connection() as conn:

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Подтверждение email{% endblock %}
+{% block content %}
+<div class="card" style="max-width:440px;margin:0 auto;">
+  <h1>Подтверждение email</h1>
+
+  {% if info %}<div class="alert alert-ok">{{ info }}</div>{% endif %}
+
+  <p class="muted">
+    Мы отправили 6-значный код на
+    <strong>{{ email or 'вашу почту' }}</strong>. Введите его ниже.
+  </p>
+
+  <form method="post" action="/verify">
+    <input type="hidden" name="email" value="{{ email or '' }}">
+
+    <label for="code">Код подтверждения</label>
+    <input type="text" id="code" name="code" required
+           inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code"
+           placeholder="000000"
+           style="letter-spacing:6px;font-size:22px;text-align:center;font-family:monospace;">
+
+    <p style="margin-top:18px;">
+      <button class="btn" type="submit">Подтвердить</button>
+    </p>
+  </form>
+
+  <form method="post" action="/verify/resend" style="margin-top:8px;">
+    <input type="hidden" name="email" value="{{ email or '' }}">
+    <button class="btn-ghost" type="submit">Отправить код заново</button>
+  </form>
+
+  <p class="muted" style="margin-top:16px;">
+    <a href="/login">Вернуться ко входу</a>
+  </p>
+</div>
+{% endblock %}

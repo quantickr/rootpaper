@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Сброс пароля{% endblock %}
+{% block content %}
+<div class="card" style="max-width:440px;margin:0 auto;">
+  <h1>Сброс пароля</h1>
+
+  {% if info %}<div class="alert alert-ok">{{ info }}</div>{% endif %}
+
+  <p class="muted">
+    Введите код из письма и новый пароль для
+    <strong>{{ email or 'вашего аккаунта' }}</strong>.
+  </p>
+
+  <form method="post" action="/reset">
+    <input type="hidden" name="email" value="{{ email or '' }}">
+
+    <label for="code">Код из письма</label>
+    <input type="text" id="code" name="code" required
+           inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code"
+           placeholder="000000"
+           style="letter-spacing:6px;font-size:22px;text-align:center;font-family:monospace;">
+
+    <label for="password">Новый пароль</label>
+    <input type="password" id="password" name="password" required
+           placeholder="минимум 8 символов, буквы и цифры">
+
+    <label for="password2">Подтверждение пароля</label>
+    <input type="password" id="password2" name="password2" required>
+
+    <p style="margin-top:18px;">
+      <button class="btn" type="submit">Сменить пароль</button>
+    </p>
+  </form>
+
+  <p class="muted" style="margin-top:16px;">
+    Не пришёл код? <a href="/forgot">Запросить заново</a>
+  </p>
+</div>
+{% endblock %}

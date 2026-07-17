@@ -275,6 +275,63 @@ class SqliteStore(Store):
                 return None
             return int(row["user_id"])
 
+    def create_email_code(
+        self, user_id: int, *, purpose: str, ttl_seconds: int
+    ) -> EmailToken:
+        now = time.time()
+        exp = now + ttl_seconds
+        with self._lock, self._connect() as conn:
+            # Оставляем один активный код на пользователя+назначение.
+            conn.execute(
+                "DELETE FROM email_tokens WHERE user_id = ? AND purpose = ?",
+                (user_id, purpose),
+            )
+            # token — PRIMARY KEY, поэтому 6-значный код должен быть уникальным
+            # среди всех активных токенов; при коллизии генерируем заново.
+            for _ in range(50):
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO email_tokens
+                            (token, user_id, purpose, created_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (code, user_id, purpose, now, exp),
+                    )
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+            else:  # pragma: no cover - крайне маловероятно
+                raise RuntimeError("Не удалось сгенерировать уникальный код")
+        return EmailToken(
+            token=code,
+            user_id=user_id,
+            purpose=purpose,
+            created_at=now,
+            expires_at=exp,
+        )
+
+    def consume_email_code(
+        self, user_id: int, code: str, *, purpose: str
+    ) -> bool:
+        code = (code or "").strip()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT expires_at FROM email_tokens "
+                "WHERE user_id = ? AND token = ? AND purpose = ?",
+                (user_id, code, purpose),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "DELETE FROM email_tokens WHERE user_id = ? AND token = ? AND purpose = ?",
+                (user_id, code, purpose),
+            )
+            if float(row["expires_at"]) < time.time():
+                return False
+            return True
+
     # ----------------------------------------------------------------- settings
     def get_settings(self, owner_id: int) -> UserSettings:
         with self._connect() as conn:

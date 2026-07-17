@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Восстановление пароля{% endblock %}
+{% block content %}
+<div class="card" style="max-width:440px;margin:0 auto;">
+  <h1>Восстановление пароля</h1>
+
+  <p class="muted">
+    Укажите email от аккаунта — мы отправим 6-значный код для сброса пароля.
+  </p>
+
+  <form method="post" action="/forgot">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" value="{{ email or '' }}" required>
+
+    <p style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить код</button>
+    </p>
+  </form>
+
+  <p class="muted" style="margin-top:16px;">
+    Вспомнили пароль? <a href="/login">Войти</a>
+  </p>
+</div>
+{% endblock %}
