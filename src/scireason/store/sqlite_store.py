@@ -88,10 +88,18 @@ class SqliteStore(Store):
                     created_at REAL    NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS report_shares (
+                    token      TEXT    PRIMARY KEY,
+                    report_id  INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+                    created_at REAL    NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_reports_owner
                     ON reports (owner_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tokens_user
                     ON email_tokens (user_id);
+                CREATE INDEX IF NOT EXISTS idx_shares_report
+                    ON report_shares (report_id);
                 """
             )
 
@@ -424,6 +432,43 @@ class SqliteStore(Store):
             row = conn.execute(
                 "SELECT html FROM reports WHERE id = ? AND owner_id = ?",
                 (int(report_id), owner_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return bytes(row["html"])
+
+    # ------------------------------------------------------------ report shares
+    def create_report_share(self, report_id: int) -> str:
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT token FROM report_shares WHERE report_id = ?",
+                (int(report_id),),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["token"])
+            for _ in range(50):
+                token = secrets.token_urlsafe(24)
+                try:
+                    conn.execute(
+                        "INSERT INTO report_shares (token, report_id, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (token, int(report_id), time.time()),
+                    )
+                    return token
+                except sqlite3.IntegrityError:
+                    continue
+            raise RuntimeError("Не удалось сгенерировать уникальный share-токен")
+
+    def get_report_html_by_share(self, token: str) -> Optional[bytes]:
+        token = (token or "").strip()
+        if not token:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT r.html AS html FROM report_shares s "
+                "JOIN reports r ON r.id = s.report_id "
+                "WHERE s.token = ?",
+                (token,),
             ).fetchone()
         if row is None:
             return None

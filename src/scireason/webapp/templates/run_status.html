@@ -5,15 +5,50 @@
   <h1>Обработка запроса</h1>
   <p><b>Запрос:</b> {{ job.query }}</p>
   <p><b>Статус:</b> <span id="status" class="pill">{{ job.status }}</span></p>
+
+  <div class="progress" aria-hidden="true">
+    <div id="progress-bar" class="progress-bar"
+         style="width: {{ (job.progress * 100)|round(0, 'floor') }}%;"></div>
+  </div>
+  <p id="stage" class="muted" style="margin-top:6px;">{{ job.stage }}</p>
+
   <p id="message" class="muted">{{ job.message }}</p>
   <div id="result"></div>
 </div>
+
+<style>
+  .progress {
+    margin-top: 14px;
+    width: 100%;
+    height: 14px;
+    background: #eceef1;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #3b82f6, #6366f1);
+    border-radius: 8px;
+    transition: width .4s ease;
+  }
+  .progress-bar.error { background: #ef4444; }
+</style>
 
 <script>
 const jobId = "{{ job.id }}";
 const statusEl = document.getElementById("status");
 const msgEl = document.getElementById("message");
+const stageEl = document.getElementById("stage");
+const barEl = document.getElementById("progress-bar");
 const resultEl = document.getElementById("result");
+
+function renderDone(reportId) {
+  barEl.style.width = "100%";
+  resultEl.innerHTML =
+    `<p style="margin-top:14px;"><a class="btn" href="/reports/${reportId}/view" target="_blank">Открыть отчёт</a> ` +
+    `&nbsp;<a class="btn-ghost" href="/reports/${reportId}/download">Скачать</a></p>`;
+}
 
 async function poll() {
   try {
@@ -22,23 +57,26 @@ async function poll() {
     const j = await r.json();
     statusEl.textContent = j.status;
     msgEl.textContent = j.message || "";
+    if (typeof j.progress === "number") {
+      barEl.style.width = Math.round(j.progress * 100) + "%";
+    }
+    if (j.stage) stageEl.textContent = j.stage;
     if (j.status === "done" && j.report_id) {
-      resultEl.innerHTML =
-        `<p><a class="btn" href="/reports/${j.report_id}/view" target="_blank">Открыть отчёт</a> ` +
-        `&nbsp;<a class="btn-ghost" href="/reports/${j.report_id}/download">Скачать</a></p>`;
+      renderDone(j.report_id);
       return;
     }
-    if (j.status === "error") return;
-    setTimeout(poll, 3000);
+    if (j.status === "error") {
+      barEl.classList.add("error");
+      barEl.style.width = "100%";
+      return;
+    }
+    setTimeout(poll, 2000);
   } catch (e) {
     setTimeout(poll, 5000);
   }
 }
 {% if job.status in ("queued", "running") %}poll();{% endif %}
-{% if job.status == "done" and job.report_id %}
-resultEl.innerHTML =
-  `<p><a class="btn" href="/reports/{{ job.report_id }}/view" target="_blank">Открыть отчёт</a> ` +
-  `&nbsp;<a class="btn-ghost" href="/reports/{{ job.report_id }}/download">Скачать</a></p>`;
-{% endif %}
+{% if job.status == "done" and job.report_id %}renderDone({{ job.report_id }});{% endif %}
+{% if job.status == "error" %}barEl.classList.add("error");barEl.style.width="100%";{% endif %}
 </script>
 {% endblock %}

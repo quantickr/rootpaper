@@ -72,5 +72,7 @@ def run_status_json(request: Request, job_id: str):
             "status": job.status,
             "message": job.message,
             "report_id": job.report_id,
+            "progress": round(job.progress, 4),
+            "stage": job.stage,
         }
     )

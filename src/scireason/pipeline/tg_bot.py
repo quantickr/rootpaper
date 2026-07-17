@@ -417,26 +417,44 @@ def build_bot_app(
             return
 
         # Сохраняем отчёт в историю (BLOB), чтобы /story работал даже без runs/.
+        # Заодно готовим публичную ссылку на HTML-версию на сайте (по токену).
+        share_url: Optional[str] = None
         try:
             html_bytes = report.read_bytes()
-            db.add_report(job.user_id, job.query, html_bytes)
+            report_id = db.add_report(job.user_id, job.query, html_bytes)
+            try:
+                token = db.create_report_share(report_id)
+                base = (settings.web_base_url or "").rstrip("/")
+                if base:
+                    share_url = f"{base}/r/{token}"
+            except Exception:  # pragma: no cover - ссылка best-effort
+                logger.exception("Failed to create share link for %r", job.query)
         except Exception:  # pragma: no cover - history is best-effort
             logger.exception("Failed to store report in history for %r", job.query)
 
+        link_line = f"\n\n🔗 Открыть на сайте: {share_url}" if share_url else ""
+
         size = report.stat().st_size
         if size > _MAX_TG_DOCUMENT_BYTES:
-            await bot.send_message(
-                job.chat_id,
+            too_big = (
                 f"Отчёт готов, но он слишком большой для Telegram "
-                f"({size // (1024 * 1024)} МБ). Он сохранён локально: {report}",
+                f"({size // (1024 * 1024)} МБ)."
             )
+            if share_url:
+                too_big += f"\n\n🔗 Открой его на сайте: {share_url}"
+            else:
+                too_big += f" Он сохранён локально: {report}"
+            await bot.send_message(job.chat_id, too_big)
             return
 
         try:
             await bot.send_document(
                 job.chat_id,
                 FSInputFile(str(report), filename="report.html"),
-                caption=f"Готово: «{job.query}». Открой файл в браузере — внутри интерактивный граф и русские саммари.",
+                caption=(
+                    f"Готово: «{job.query}». Открой файл в браузере — "
+                    f"внутри интерактивный граф и русские саммари.{link_line}"
+                ),
             )
         except Exception as e:  # pragma: no cover - runtime failure path
             logger.exception("Failed to send report for query=%r", job.query)

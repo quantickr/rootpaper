@@ -31,6 +31,8 @@ class Job:
     status: str = "queued"  # queued | running | done | error
     message: str = ""
     report_id: Optional[int] = None
+    progress: float = 0.0  # 0.0–1.0, обновляется колбэком пайплайна
+    stage: str = ""  # человекочитаемая метка текущего этапа
     created_at: float = field(default_factory=time.time)
 
 
@@ -58,6 +60,14 @@ class JobManager:
             jobs = [j for j in self._jobs.values() if j.owner_id == owner_id]
         return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
+    def _set_progress(self, job: Job, label: str, fraction: float) -> None:
+        """Колбэк прогресса из пайплайна (вызывается из рабочего потока)."""
+
+        with self._lock:
+            job.stage = label
+            # Прогресс не должен уменьшаться и держится ниже 100% до статуса done.
+            job.progress = max(job.progress, min(0.99, float(fraction)))
+
     # ------------------------------------------------------------------ worker
     def _run(self, job_id: str) -> None:
         from ..pipeline.e2e import run_pipeline
@@ -67,6 +77,8 @@ class JobManager:
         if job is None:
             return
         job.status = "running"
+        job.progress = 0.02
+        job.stage = "Запускаю обработку…"
         db = get_store()
         settings = db.get_settings(job.owner_id)
         sources_csv = settings.sources_csv()
@@ -79,6 +91,7 @@ class JobManager:
                 search_limit=settings.search_limit,
                 use_llm_for_hypotheses=True,
                 generate_report=True,
+                progress_fn=lambda label, frac: self._set_progress(job, label, frac),
             )
         except Exception as e:  # pragma: no cover - runtime path
             logger.exception("Web pipeline failed for %r", job.query)
@@ -96,6 +109,8 @@ class JobManager:
             rid = db.add_report(job.owner_id, job.query, html, origin="web")
             job.report_id = rid
             job.status = "done"
+            job.progress = 1.0
+            job.stage = "Готово"
             job.message = "Готово."
         except Exception as e:  # pragma: no cover
             logger.exception("Failed to store web report for %r", job.query)

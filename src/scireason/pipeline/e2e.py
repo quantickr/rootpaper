@@ -20,7 +20,7 @@ import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from rich.console import Console
 
@@ -41,6 +41,21 @@ except Exception:  # pragma: no cover - defensive import
 
 
 console = Console()
+
+
+# Тип колбэка прогресса: (человекочитаемая метка этапа, доля 0.0–1.0).
+ProgressFn = Callable[[str, float], None]
+
+
+def _emit(progress_fn: Optional[ProgressFn], label: str, fraction: float) -> None:
+    """Безопасно сообщить прогресс наружу (не роняем пайплайн из-за колбэка)."""
+
+    if progress_fn is None:
+        return
+    try:
+        progress_fn(label, max(0.0, min(1.0, float(fraction))))
+    except Exception:  # pragma: no cover - колбэк не должен ломать пайплайн
+        pass
 
 
 def _to_english_query(query: str) -> str:
@@ -107,9 +122,16 @@ def run_pipeline(
     include_multimodal: bool = False,
     use_llm_for_hypotheses: bool = True,
     generate_report: bool = True,
+    progress_fn: Optional[ProgressFn] = None,
 ) -> Path:
-    """Run end-to-end pipeline and return the run directory."""
+    """Run end-to-end pipeline and return the run directory.
 
+    ``progress_fn`` — необязательный колбэк ``(label, fraction)`` для отображения
+    прогресса по этапам (например, на странице запроса сайта). Доля в диапазоне
+    0.0–1.0. Колбэк best-effort: исключения внутри него игнорируются.
+    """
+
+    _emit(progress_fn, "Готовлюсь…", 0.02)
     domain = load_domain_config(domain_id)
 
     # Run id
@@ -132,6 +154,7 @@ def run_pipeline(
     # 1) Search papers.
     # Paper APIs (arXiv etc.) are English-language, so translate a Russian query
     # to English for the search while keeping the original query for the report.
+    _emit(progress_fn, "Ищу статьи…", 0.05)
     search_query = _to_english_query(query)
     if search_query != query:
         console.print(f"[cyan]Translated query:[/cyan] '{query}' -> '{search_query}'")
@@ -150,6 +173,7 @@ def run_pipeline(
     console.print(f"[green]Selected papers:[/green] {len(selected)}")
 
     # 2) Acquire PDFs (best-effort)
+    _emit(progress_fn, "Скачиваю PDF…", 0.15)
     console.print("[bold cyan]Acquire PDFs[/bold cyan]")
     acq = acquire_pdfs(selected, raw_dir=out / "raw_pdfs", meta_dir=out / "raw_meta")
     (out / "acquire_results.json").write_text(
@@ -161,8 +185,17 @@ def run_pipeline(
     processed_dir = out / "processed_papers"
     processed_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit(progress_fn, "Обрабатываю PDF…", 0.25)
     ingested_ids: set[str] = set()
-    for a, paper in zip(acq, selected):
+    _pairs = list(zip(acq, selected))
+    _total_pairs = len(_pairs) or 1
+    for _idx, (a, paper) in enumerate(_pairs):
+        # Прогресс обработки PDF: 0.25 → 0.55 по мере прохождения статей.
+        _emit(
+            progress_fn,
+            f"Обрабатываю PDF ({_idx + 1}/{_total_pairs})…",
+            0.25 + 0.30 * (_idx / _total_pairs),
+        )
         if not a.pdf_path:
             continue
         meta = paper.model_dump(mode="json")
@@ -193,6 +226,7 @@ def run_pipeline(
     )
 
     # 5) Build temporal KG
+    _emit(progress_fn, "Строю граф знаний…", 0.60)
     edge_mode = str((domain.term_graph or {}).get("edge_mode", "auto"))
     console.print(f"[bold cyan]Build temporal KG[/bold cyan] edge_mode={edge_mode}")
     kg = build_temporal_kg(
@@ -207,6 +241,7 @@ def run_pipeline(
 
     # 5b) Interactive run report: graph map + per-paper summaries with drill-down.
     if generate_report:
+        _emit(progress_fn, "Собираю отчёт…", 0.78)
         console.print("[bold cyan]Build interactive report[/bold cyan]")
         try:
             from .report import write_run_report
@@ -227,6 +262,7 @@ def run_pipeline(
             )
 
     # 6) Generate hypotheses
+    _emit(progress_fn, "Генерирую гипотезы…", 0.90)
     console.print("[bold cyan]Generate hypotheses[/bold cyan]")
     hyps = generate_hypotheses(
         kg,
@@ -308,5 +344,6 @@ def run_pipeline(
         encoding="utf-8",
     )
 
+    _emit(progress_fn, "Готово", 1.0)
     console.print(f"[bold green]DONE[/bold green] Run dir: {out}")
     return out

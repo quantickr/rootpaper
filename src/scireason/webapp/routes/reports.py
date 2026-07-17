@@ -101,6 +101,27 @@ def report_download(request: Request, report_id: int):
     )
 
 
+@router.get("/r/{token}", response_class=HTMLResponse)
+def report_shared_view(request: Request, token: str):
+    """Публичный просмотр отчёта по секретному share-токену (без логина).
+
+    Доступ ограничен «секретом в URL»: угадать unguessable token нельзя.
+    Используется ссылками из Telegram-бота.
+    """
+
+    html = get_db().get_report_html_by_share(token)
+    if html is None:
+        resp = render(
+            request,
+            "message.html",
+            title="Отчёт не найден",
+            message="Ссылка недействительна или отчёт был удалён.",
+        )
+        resp.status_code = 404
+        return resp
+    return HTMLResponse(content=html.decode("utf-8", errors="replace"))
+
+
 @router.get("/settings")
 def settings_form(request: Request):
     user = current_user(request)

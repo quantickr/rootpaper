@@ -250,6 +250,18 @@ class Store(ABC):
     def get_report_html(self, owner_id: int, report_id: int) -> Optional[bytes]:
         """HTML отчёта, только если он принадлежит ``owner_id``."""
 
+    # ----------------------------------------------------------- report shares
+    @abstractmethod
+    def create_report_share(self, report_id: int) -> str:
+        """Вернуть публичный share-токен отчёта, создав его при необходимости.
+
+        Идемпотентно: если у отчёта уже есть токен — возвращается он же.
+        """
+
+    @abstractmethod
+    def get_report_html_by_share(self, token: str) -> Optional[bytes]:
+        """HTML отчёта по публичному share-токену (без проверки владельца)."""
+
     # ------------------------------------------------------------- stats
     @abstractmethod
     def stats_global(self) -> dict:

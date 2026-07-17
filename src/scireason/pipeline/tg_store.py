@@ -112,3 +112,8 @@ class TgStore:
 
     def get_report_html(self, user_id: int, report_id: int) -> Optional[bytes]:
         return self._store.get_report_html(self._owner_id(user_id), report_id)
+
+    def create_report_share(self, report_id: int) -> str:
+        """Публичный share-токен отчёта для ссылки на сайт (из бота)."""
+
+        return self._store.create_report_share(report_id)
