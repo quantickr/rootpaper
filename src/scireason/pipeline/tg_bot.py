@@ -177,6 +177,27 @@ def build_bot_app(
             "Кнопки с числами попросят ввести новое значение сообщением."
         )
 
+    def _main_menu_kb() -> "InlineKeyboardMarkup":
+        """Главное меню бота на inline-кнопках (вместо набора команд)."""
+
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="menu:search")],
+                [
+                    InlineKeyboardButton(text="🗂 Мои отчёты", callback_data="menu:story"),
+                    InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
+                ],
+                [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="menu:help")],
+            ]
+        )
+
+    _MENU_TEXT = (
+        "Привет! Я <b>rootpaper</b> — присылай тему научного поиска на русском, "
+        "и я найду статьи (в т.ч. с arXiv), построю интерактивный граф и русские "
+        "саммари, и верну HTML-отчёт.\n\n"
+        "Просто напиши тему сообщением или выбери действие ниже 👇"
+    )
+
     def _story_page_kb(user_id: int, offset: int) -> "Optional[InlineKeyboardMarkup]":
         total = db.count_reports(user_id)
         rows: List[List[InlineKeyboardButton]] = []
@@ -210,47 +231,26 @@ def build_bot_app(
             return None
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # ----------------------------------------------------------------- commands
-    @dp.message(CommandStart())
-    async def _start(message: Message) -> None:
-        await message.answer(
-            "Привет! Пришли тему научного поиска на русском — я найду статьи "
-            "(в т.ч. с arXiv), построю интерактивный граф и русские саммари, "
-            "и верну HTML-отчёт.\n\n"
-            "Команды:\n"
-            "• /settings — источники и лимиты под себя\n"
-            "• /story — прошлые отчёты (по 5 штук)\n"
-            "• /help — подробности\n\n"
-            "Есть и веб-версия: там можно завести аккаунт по почте и привязать "
-            "этот Telegram — история отчётов объединится.\n\n"
-            "Например: <b>прогнозирование трафика с помощью глубокого обучения</b>",
-            parse_mode="HTML",
-        )
+    _HELP_TEXT = (
+        "Просто отправь тему на русском (или английском). "
+        "Обработка занимает время (поиск, скачивание PDF, построение графа), "
+        "я пришлю отчёт файлом, как только он будет готов.\n\n"
+        "Кнопки меню (или команды):\n"
+        "• 🔎 Новый поиск — просто пришли тему сообщением.\n"
+        "• ⚙️ Настройки (/settings) — источники и лимиты search-limit / top-papers.\n"
+        "• 🗂 Мои отчёты (/story) — прошлые отчёты; жми на запись, чтобы скачать HTML.\n\n"
+        "Есть и веб-версия: заведи аккаунт по почте и привяжи этот Telegram — "
+        "история отчётов объединится."
+    )
 
-    @dp.message(Command("help"))
-    async def _help(message: Message) -> None:
-        await message.answer(
-            "Просто отправь тему на русском (или английском). "
-            "Обработка занимает время (поиск, скачивание PDF, построение графа), "
-            "я пришлю отчёт файлом, как только он будет готов.\n\n"
-            "• /settings — выбрать источники и задать search-limit / top-papers. "
-            "Настройки запоминаются и применяются ко всем твоим запросам.\n"
-            "• /story — показать прошлые отчёты по 5 штук; жми на запись, "
-            "чтобы скачать HTML."
-        )
-
-    @dp.message(Command("settings"))
-    async def _settings_cmd(message: Message) -> None:
-        user_id = message.from_user.id if message.from_user else message.chat.id
+    async def _send_settings(message: "Message", user_id: int) -> None:
         awaiting_number.pop(user_id, None)
         s = db.get_settings(user_id)
         await message.answer(
             _settings_text(s), parse_mode="HTML", reply_markup=_settings_keyboard(s)
         )
 
-    @dp.message(Command("story"))
-    async def _story_cmd(message: Message) -> None:
-        user_id = message.from_user.id if message.from_user else message.chat.id
+    async def _send_story(message: "Message", user_id: int) -> None:
         total = db.count_reports(user_id)
         if total == 0:
             await message.answer(
@@ -262,6 +262,82 @@ def build_bot_app(
             f"Твои отчёты (всего {total}). Жми на запись, чтобы скачать HTML:",
             reply_markup=kb,
         )
+
+    async def _enqueue_query(message: "Message", text: str) -> None:
+        """Поставить тему в очередь обработки и подтвердить пользователю."""
+
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        if message.from_user is not None:
+            try:
+                db.ensure_tg_user(user_id, message.from_user.username)
+            except Exception:  # pragma: no cover - best-effort
+                pass
+        status = await message.answer(
+            "Принял запрос в очередь. Обрабатываю — это может занять несколько минут…"
+        )
+        await queue.put(
+            _Job(
+                chat_id=message.chat.id,
+                user_id=user_id,
+                status_message_id=status.message_id,
+                query=text,
+            )
+        )
+
+    # ----------------------------------------------------------------- commands
+    @dp.message(CommandStart())
+    @dp.message(Command("menu"))
+    async def _start(message: Message) -> None:
+        await message.answer(
+            _MENU_TEXT, parse_mode="HTML", reply_markup=_main_menu_kb()
+        )
+
+    @dp.message(Command("search"))
+    async def _search_cmd(message: Message) -> None:
+        # Тема может идти прямо в команде: "/search графовые нейросети".
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 2 and parts[1].strip():
+            await _enqueue_query(message, parts[1].strip())
+            return
+        await message.answer(
+            "Пришли тему научного поиска одним сообщением — например, "
+            "<b>графовые нейросети для рекомендаций</b>.",
+            parse_mode="HTML",
+        )
+
+    @dp.message(Command("help"))
+    async def _help(message: Message) -> None:
+        await message.answer(_HELP_TEXT, reply_markup=_main_menu_kb())
+
+    @dp.message(Command("settings"))
+    async def _settings_cmd(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        await _send_settings(message, user_id)
+
+    @dp.message(Command("story"))
+    async def _story_cmd(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        await _send_story(message, user_id)
+
+    # -------------------------------------------------------------- menu buttons
+    @dp.callback_query(F.data.startswith("menu:"))
+    async def _cb_menu(cb: CallbackQuery) -> None:
+        user_id = cb.from_user.id
+        action = cb.data.split(":", 1)[1]
+        if action == "search":
+            awaiting_number.pop(user_id, None)
+            await cb.message.answer(
+                "Пришли тему научного поиска одним сообщением — например, "
+                "<b>графовые нейросети для рекомендаций</b>.",
+                parse_mode="HTML",
+            )
+        elif action == "story":
+            await _send_story(cb.message, user_id)
+        elif action == "settings":
+            await _send_settings(cb.message, user_id)
+        elif action == "help":
+            await cb.message.answer(_HELP_TEXT, reply_markup=_main_menu_kb())
+        await cb.answer()
 
     # ------------------------------------------------------------- callbacks
     @dp.callback_query(F.data.startswith("src:"))
@@ -369,17 +445,7 @@ def build_bot_app(
         if not text:
             await message.answer("Пустой запрос. Пришли тему текстом.")
             return
-        status = await message.answer(
-            "Принял запрос в очередь. Обрабатываю — это может занять несколько минут…"
-        )
-        await queue.put(
-            _Job(
-                chat_id=message.chat.id,
-                user_id=user_id,
-                status_message_id=status.message_id,
-                query=text,
-            )
-        )
+        await _enqueue_query(message, text)
 
     # ------------------------------------------------------------- job pipeline
     async def _process_job(job: _Job) -> None:
@@ -447,6 +513,16 @@ def build_bot_app(
             await bot.send_message(job.chat_id, too_big)
             return
 
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        open_kb = None
+        if share_url:
+            open_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔗 Открыть на сайте", url=share_url)]
+                ]
+            )
+
         try:
             await bot.send_document(
                 job.chat_id,
@@ -455,6 +531,7 @@ def build_bot_app(
                     f"Готово: «{job.query}». Открой файл в браузере — "
                     f"внутри интерактивный граф и русские саммари.{link_line}"
                 ),
+                reply_markup=open_kb,
             )
         except Exception as e:  # pragma: no cover - runtime failure path
             logger.exception("Failed to send report for query=%r", job.query)
@@ -475,6 +552,21 @@ def build_bot_app(
         for i in range(max(1, workers)):
             asyncio.create_task(_worker(i))
         logger.info("Started %d pipeline worker(s)", workers)
+        # Меню команд Telegram (кнопка «/» у поля ввода). search — первым.
+        try:
+            from aiogram.types import BotCommand
+
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="search", description="🔎 Новый научный поиск"),
+                    BotCommand(command="story", description="🗂 Мои отчёты"),
+                    BotCommand(command="settings", description="⚙️ Настройки"),
+                    BotCommand(command="menu", description="📋 Главное меню"),
+                    BotCommand(command="help", description="ℹ️ Помощь"),
+                ]
+            )
+        except Exception:  # pragma: no cover - best-effort
+            logger.exception("Failed to set bot commands")
 
     dp.startup.register(_on_startup)
     return bot, dp

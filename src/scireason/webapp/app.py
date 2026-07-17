@@ -27,7 +27,7 @@ def create_app():
     from .routes import account, auth, dashboard, pipeline, reports
 
     app = FastAPI(
-        title="top-papers-graph — сайт",
+        title="rootpaper — сайт",
         version="0.1.0",
         description="Веб-интерфейс с регистрацией, историей отчётов и запуском пайплайна.",
     )

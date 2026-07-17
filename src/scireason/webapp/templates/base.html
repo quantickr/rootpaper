@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}top-papers-graph{% endblock %}</title>
+  <title>{% block title %}rootpaper{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/">top-papers-graph</a>
+    <a class="brand" href="/">rootpaper</a>
     <nav>
       {% if user %}
         <a href="/run">Новый запрос</a>
@@ -35,7 +35,7 @@
   </main>
 
   <footer class="footer">
-    <span>top-papers-graph · GPLv3</span>
+    <span>rootpaper</span>
   </footer>
   {% block scripts %}{% endblock %}
 </body>

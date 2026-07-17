@@ -10,7 +10,10 @@
     <div id="progress-bar" class="progress-bar"
          style="width: {{ (job.progress * 100)|round(0, 'floor') }}%;"></div>
   </div>
-  <p id="stage" class="muted" style="margin-top:6px;">{{ job.stage }}</p>
+  <p style="margin-top:6px;display:flex;justify-content:space-between;gap:12px;">
+    <span id="stage" class="muted">{{ job.stage }}</span>
+    <span id="pct" class="muted">{{ (job.progress * 100)|round(0, 'floor')|int }}%</span>
+  </p>
 
   <p id="message" class="muted">{{ job.message }}</p>
   <div id="result"></div>
@@ -29,10 +32,22 @@
     height: 100%;
     width: 0%;
     background: linear-gradient(90deg, #3b82f6, #6366f1);
+    background-size: 200% 100%;
     border-radius: 8px;
-    transition: width .4s ease;
+    /* Плавное перетекание при собственном «подкрадывании» прогресса. */
+    transition: width .25s linear;
+    animation: barflow 2s linear infinite;
   }
-  .progress-bar.error { background: #ef4444; }
+  .progress-bar.error {
+    background: #ef4444;
+    animation: none;
+  }
+  .progress-bar.done { animation: none; }
+  @keyframes barflow {
+    0%   { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+  }
+  #pct { font-variant-numeric: tabular-nums; }
 </style>
 
 <script>
@@ -40,11 +55,43 @@ const jobId = "{{ job.id }}";
 const statusEl = document.getElementById("status");
 const msgEl = document.getElementById("message");
 const stageEl = document.getElementById("stage");
+const pctEl = document.getElementById("pct");
 const barEl = document.getElementById("progress-bar");
 const resultEl = document.getElementById("result");
 
+// Псевдо-прогресс: bar плавно «подкрадывается» к target между опросами сервера,
+// поэтому даже на долгих этапах полоса не выглядит застывшей. shown никогда
+// не убывает и не перескакивает 100% до реального done.
+let shown = {{ (job.progress * 100)|round(2) }};   // текущее показанное, %
+let target = shown;                                  // куда стремимся, %
+let finished = false;
+
+function setBar(p) {
+  p = Math.max(0, Math.min(100, p));
+  barEl.style.width = p.toFixed(1) + "%";
+  pctEl.textContent = Math.round(p) + "%";
+}
+
+// Кадр анимации: приближаем shown к target с затуханием (быстро -> медленно).
+function tick() {
+  if (finished) return;
+  // Пока ждём следующий этап, потолок ползёт чуть выше текущего target,
+  // но не выше 95%, чтобы «не упереться» и не обмануть на 100%.
+  const ceil = Math.min(95, target + 6);
+  if (shown < ceil) {
+    const gap = ceil - shown;
+    shown += Math.max(0.06, gap * 0.012);   // затухающее приближение
+    if (shown > ceil) shown = ceil;
+    setBar(shown);
+  }
+  requestAnimationFrame(tick);
+}
+
 function renderDone(reportId) {
-  barEl.style.width = "100%";
+  finished = true;
+  barEl.classList.add("done");
+  setBar(100);
+  stageEl.textContent = "Готово";
   resultEl.innerHTML =
     `<p style="margin-top:14px;"><a class="btn" href="/reports/${reportId}/view" target="_blank">Открыть отчёт</a> ` +
     `&nbsp;<a class="btn-ghost" href="/reports/${reportId}/download">Скачать</a></p>`;
@@ -53,12 +100,13 @@ function renderDone(reportId) {
 async function poll() {
   try {
     const r = await fetch(`/run/${jobId}/state`);
-    if (!r.ok) return;
+    if (!r.ok) { setTimeout(poll, 3000); return; }
     const j = await r.json();
     statusEl.textContent = j.status;
     msgEl.textContent = j.message || "";
     if (typeof j.progress === "number") {
-      barEl.style.width = Math.round(j.progress * 100) + "%";
+      // target только растёт: реальные этапы двигают полосу вперёд.
+      target = Math.max(target, j.progress * 100);
     }
     if (j.stage) stageEl.textContent = j.stage;
     if (j.status === "done" && j.report_id) {
@@ -66,8 +114,9 @@ async function poll() {
       return;
     }
     if (j.status === "error") {
+      finished = true;
       barEl.classList.add("error");
-      barEl.style.width = "100%";
+      setBar(100);
       return;
     }
     setTimeout(poll, 2000);
@@ -75,8 +124,13 @@ async function poll() {
     setTimeout(poll, 5000);
   }
 }
-{% if job.status in ("queued", "running") %}poll();{% endif %}
+
+{% if job.status in ("queued", "running") %}
+setBar(shown);
+requestAnimationFrame(tick);
+poll();
+{% endif %}
 {% if job.status == "done" and job.report_id %}renderDone({{ job.report_id }});{% endif %}
-{% if job.status == "error" %}barEl.classList.add("error");barEl.style.width="100%";{% endif %}
+{% if job.status == "error" %}finished = true; barEl.classList.add("error"); setBar(100);{% endif %}
 </script>
 {% endblock %}
