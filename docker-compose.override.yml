@@ -40,3 +40,7 @@ services:
       SQLITE_DB_PATH: /app/runs/tpg.sqlite3
       GRAPH_BACKEND: none
     depends_on: !reset []
+    # Timeweb блокирует TCP:443 к большинству IP Telegram. Пиним рабочий IP
+    # api.telegram.org, иначе бот не может подключиться (polling висит).
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
