@@ -51,7 +51,12 @@ COPY data ./data
 # Устанавливаем пакет с web-extra (fastapi/uvicorn/jinja2/bcrypt/itsdangerous/
 # psycopg) и рантайм-зависимости пайплайна, идентичные боту, чтобы запуск
 # пайплайна с сайта работал так же (перевод/детекция языка/PDF).
+# CPU-only torch ставим ПЕРВЫМ и с CPU-индекса PyTorch. argostranslate тянет
+# stanza -> torch, а обычный torch на Linux тащит несколько ГБ CUDA/nvidia-колёс,
+# бесполезных на сервере без GPU. Ставя CPU-torch заранее, stanza видит его
+# установленным и не подтягивает GPU-стек (образ меньше на ~3-4 ГБ).
 RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=1.3.0" && \
     python -m pip install -e ".[web]" && \
     python -m pip install argostranslate pymupdf langdetect fasttext-wheel
 

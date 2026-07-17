@@ -20,6 +20,10 @@
 
 services:
   web:
+    # Готовый образ из GitHub Container Registry (собран под linux/amd64).
+    # На сервере: docker compose --profile web pull web && ... up -d web
+    # (сборка не нужна). Локально можно по-прежнему собирать: build web.
+    image: ghcr.io/quantickr/rootpaper-web:latest
     environment:
       # Пусто -> SQLite (см. store/factory.py). Общий файл с ботом.
       DATABASE_URL: ""
@@ -30,6 +34,7 @@ services:
     depends_on: !reset []
 
   bot:
+    image: ghcr.io/quantickr/rootpaper-bot:latest
     environment:
       DATABASE_URL: ""
       SQLITE_DB_PATH: /app/runs/tpg.sqlite3
