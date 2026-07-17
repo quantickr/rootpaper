@@ -26,6 +26,17 @@ from ..email_utils import send_password_reset_code, send_verification_code
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Минимальный интервал между запросами кода (verify/reset) на один аккаунт.
+EMAIL_CODE_COOLDOWN_SECONDS = 60
+
+
+def _cooldown_message(remaining: float) -> str:
+    secs = max(1, int(round(remaining)))
+    return (
+        f"Код уже отправлен. Запросить новый можно через {secs} сек. "
+        "Проверьте почту (в т.ч. спам)."
+    )
+
 
 def _admin_emails() -> set[str]:
     raw = settings.admin_emails or ""
@@ -139,6 +150,16 @@ def verify_resend(request: Request, email: str = Form(...)):
     email = email.strip().lower()
     user = db.get_user_by_email(email)
     if user is not None and not user.email_verified:
+        remaining = db.email_code_cooldown_remaining(
+            user.id, purpose="verify", cooldown_seconds=EMAIL_CODE_COOLDOWN_SECONDS
+        )
+        if remaining > 0:
+            return render(
+                request,
+                "verify_code.html",
+                email=email,
+                error=_cooldown_message(remaining),
+            )
         code = db.create_email_code(
             user.id, purpose="verify", ttl_seconds=settings.email_verify_ttl_seconds
         )
@@ -174,7 +195,17 @@ def login_submit(
             request, "login.html", error="Неверный email или пароль.", email=email
         )
     if not user.email_verified:
-        # Отправим свежий код и сразу покажем форму ввода.
+        # Отправим свежий код и сразу покажем форму ввода — с учётом кулдауна.
+        remaining = db.email_code_cooldown_remaining(
+            user.id, purpose="verify", cooldown_seconds=EMAIL_CODE_COOLDOWN_SECONDS
+        )
+        if remaining > 0:
+            return render(
+                request,
+                "verify_code.html",
+                email=email,
+                error=_cooldown_message(remaining),
+            )
         code = db.create_email_code(
             user.id, purpose="verify", ttl_seconds=settings.email_verify_ttl_seconds
         )
@@ -219,12 +250,18 @@ def forgot_submit(request: Request, email: str = Form(...)):
     if security.is_valid_email(email):
         user = db.get_user_by_email(email)
         if user is not None and user.email:
-            code = db.create_email_code(
-                user.id,
-                purpose="reset",
-                ttl_seconds=settings.email_verify_ttl_seconds,
+            # Кулдаун: если код уже слали недавно, молча пропускаем повторную
+            # отправку (сообщение остаётся нейтральным, без раскрытия аккаунта).
+            remaining = db.email_code_cooldown_remaining(
+                user.id, purpose="reset", cooldown_seconds=EMAIL_CODE_COOLDOWN_SECONDS
             )
-            send_password_reset_code(email, code.token)
+            if remaining <= 0:
+                code = db.create_email_code(
+                    user.id,
+                    purpose="reset",
+                    ttl_seconds=settings.email_verify_ttl_seconds,
+                )
+                send_password_reset_code(email, code.token)
     # Всегда ведём на форму ввода кода с нейтральным сообщением.
     return render(request, "reset.html", email=email, info=_RESET_NEUTRAL)
 

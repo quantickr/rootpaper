@@ -340,6 +340,22 @@ class PostgresStore(Store):
                     return False
                 return True
 
+    def email_code_cooldown_remaining(
+        self, user_id: int, *, purpose: str, cooldown_seconds: int
+    ) -> float:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM email_tokens "
+                "WHERE user_id = %s AND purpose = %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id, purpose),
+            ).fetchone()
+        if row is None:
+            return 0.0
+        elapsed = time.time() - float(row[0])
+        remaining = cooldown_seconds - elapsed
+        return remaining if remaining > 0 else 0.0
+
     # ----------------------------------------------------------------- settings
     def get_settings(self, owner_id: int) -> UserSettings:
         with self._pool.connection() as conn:

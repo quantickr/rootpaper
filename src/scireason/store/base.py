@@ -216,6 +216,17 @@ class Store(ABC):
         Возвращает False, если код неверный, с другим ``purpose`` или истёк.
         """
 
+    @abstractmethod
+    def email_code_cooldown_remaining(
+        self, user_id: int, *, purpose: str, cooldown_seconds: int
+    ) -> float:
+        """Сколько секунд осталось до разрешения нового кода (0.0 = можно).
+
+        Смотрит на ``created_at`` последнего активного кода этого
+        пользователя+назначения. Если с момента выдачи прошло меньше
+        ``cooldown_seconds``, возвращает остаток (>0), иначе 0.0.
+        """
+
     # ------------------------------------------------------------- settings
     @abstractmethod
     def get_settings(self, owner_id: int) -> UserSettings:
