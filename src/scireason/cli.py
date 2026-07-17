@@ -1,0 +1,1483 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .config import settings
+from .domain import load_domain_config
+
+from .connectors.arxiv import search as arxiv_search
+from .connectors.openalex import search_works as openalex_search
+from .connectors.semantic_scholar import search_papers as s2_search
+
+from .connectors.crossref import search_works as crossref_search
+from .connectors.pubmed import search as pubmed_search
+from .connectors.europe_pmc import search as europepmc_search
+from .connectors.biorxiv import (
+    details_by_doi as biorxiv_details_by_doi,
+    details_by_interval as biorxiv_details_by_interval,
+    normalize_record as biorxiv_normalize_record,
+)
+
+from .ingest.pipeline import ingest_pdf
+from .ingest.mm_pipeline import ingest_pdf_multimodal
+from .ingest.one_click import one_click_ingest_arxiv, normalize_arxiv_id
+
+from .graph.build_kg import build_from_paper_dir
+from .graph.build_tg_mmkg import build_temporal_and_multimodal
+from .graph.graphrag_query import retrieve_context
+from .graph.review_applier import compile_overrides
+from .graph.temporal_neo4j_store import Neo4jTemporalStore
+
+from .temporal.schemas import TemporalTriplet, TimeInterval
+
+from .agents.debate_graph import run_debate
+from .agents.hypothesis_tester import load_hypothesis_from_json, test_hypothesis
+
+from .pipeline.e2e import run_pipeline
+from .pipeline.demo import run_demo_pipeline
+from .pipeline.task2_validation import prepare_task2_validation_bundle as prepare_task2_validation_pipeline_bundle
+from .task2_validation import build_task2_validation_bundle
+from .task3_hypothesis_generation import prepare_task3_hypothesis_bundle
+from .scidatapipe_bridge import export_dataset as export_scidatapipe_dataset
+
+
+app = typer.Typer(help="top-papers-graph CLI (ex SciReason)", add_completion=False)
+console = Console()
+
+def _user_agent() -> str:
+    """Build a polite User-Agent for external APIs.
+
+    Many scholarly APIs (Crossref/OpenAlex/arXiv/NCBI) recommend identifying your client
+    and providing a contact email.
+    """
+    if settings.user_agent:
+        return settings.user_agent
+    if settings.contact_email:
+        return f"top-papers-graph (mailto:{settings.contact_email})"
+    return "top-papers-graph"
+
+
+
+def _normalize_meta(meta: Dict[str, Any], *, fallback_id: str, source: str = "") -> Dict[str, Any]:
+    """Normalize metadata to the minimal fields used across the repo."""
+    m = dict(meta)
+
+    # id
+    if not m.get("id"):
+        # prefer DOI if present, else fallback
+        if m.get("doi"):
+            m["id"] = f"doi:{m['doi']}"
+        else:
+            m["id"] = fallback_id
+
+    # title
+    m.setdefault("title", "")
+
+    # year
+    if not m.get("year"):
+        published = str(m.get("published") or "")
+        if len(published) >= 4 and published[:4].isdigit():
+            m["year"] = int(published[:4])
+
+    # source / url
+    if source:
+        m.setdefault("source", source)
+    m.setdefault("url", m.get("id") if isinstance(m.get("id"), str) and m["id"].startswith("http") else "")
+
+    return m
+
+
+@app.command()
+def doctor() -> None:
+    """Проверка окружения/настроек."""
+    domain_cfg = load_domain_config()
+
+    t = Table(title="top-papers-graph doctor")
+    t.add_column("Key")
+    t.add_column("Value")
+
+    t.add_row("Domain", f"{domain_cfg.domain_id} — {domain_cfg.title}")
+    t.add_row("LLM provider", settings.llm_provider)
+    t.add_row("LLM model", settings.llm_model)
+    t.add_row("Embed provider", settings.embed_provider)
+    t.add_row("Embed model", settings.embed_model)
+    t.add_row("Neo4j", settings.neo4j_uri)
+    t.add_row("Qdrant", settings.qdrant_url)
+    t.add_row("GROBID", settings.grobid_url)
+    t.add_row("CONTACT_EMAIL", str(settings.contact_email or ""))
+    t.add_row("USER_AGENT", _user_agent())
+    t.add_row("NCBI_EMAIL", str((settings.ncbi_email or settings.contact_email) or ""))
+    t.add_row("VLM backend", settings.vlm_backend)
+    t.add_row("MM embed backend", settings.mm_embed_backend)
+
+    console.print(t)
+    console.print("[green]Если сервисы подняты через docker compose — вы готовы.[/green]")
+
+    # g4f sanity: list working models from g4f/models.py (no network call)
+    try:
+        import g4f  # type: ignore
+        from g4f import models as gm  # type: ignore
+
+        models_list = []
+        try:
+            Model = getattr(gm, "Model", None)
+            if Model is not None and hasattr(Model, "__all__"):
+                cand = Model.__all__()  # type: ignore
+                if isinstance(cand, (list, tuple)):
+                    models_list = list(cand)
+        except Exception:
+            models_list = []
+
+        if not models_list:
+            models_list = list(getattr(gm, "_all_models", []) or [])
+
+        console.print(f"g4f: {getattr(g4f, '__version__', 'unknown')} | models (working): {len(models_list)}")
+        if models_list:
+            console.print("g4f sample models: " + ", ".join(models_list[:10]))
+    except Exception as e:
+        console.print(f"g4f: not available ({e})")
+
+
+
+@app.command()
+def fetch(
+    query: str,
+    source: str = typer.Option(
+        "arxiv",
+        help="arxiv|openalex|s2|crossref|pubmed|europepmc|biorxiv|medrxiv",
+    ),
+    limit: int = typer.Option(10, help="Сколько результатов вернуть (где поддерживается)"),
+    out: Path = typer.Option(Path("data/papers/search.json"), help="Куда сохранить JSON"),
+    with_abstract: bool = typer.Option(False, help="PubMed: подтянуть абстракт (EFetch)."),
+    cursor: int = typer.Option(0, help="biorxiv/medrxiv: cursor для пагинации (по 100 записей)."),
+    category: Optional[str] = typer.Option(None, help="biorxiv/medrxiv: фильтр subject category."),
+    normalize: bool = typer.Option(False, help="Нормализовать к единому PaperMetadata schema (Pydantic)"),
+) -> None:
+    """Поиск статей (метаданные) в одном из источников.
+
+    Источники:
+    - arxiv: arXiv Atom API (пример query: "all:graph rag" или "cat:cs.AI AND all:retrieval")
+    - openalex: OpenAlex works search
+    - s2: Semantic Scholar Graph API
+    - crossref: Crossref works search (часто полезно для кандидатов DOI)
+    - pubmed: NCBI PubMed E-utilities (ESearch + ESummary; опц. EFetch для абстрактов)
+    - europepmc: Europe PMC (агрегатор PubMed + PMC + preprints и др.)
+    - biorxiv/medrxiv: bioRxiv details API (query = DOI "10.1101/..." или interval "YYYY-MM-DD/YYYY-MM-DD" / "Nd" / "N")
+    """
+    src = source.lower().strip()
+    ua = _user_agent()
+
+    # Unified normalization layer: returns PaperMetadata[] for all sources.
+    if normalize:
+        from scireason.papers import PaperSource as _PS, search_papers as _search
+
+        srcs = None
+        if src not in ("all", "*"):
+            parts = [p.strip() for p in src.split(",") if p.strip()]
+            srcs = []
+            for p in parts:
+                # map legacy shorthand
+                if p in ("s2", "semanticscholar"):
+                    p = "semantic_scholar"
+                if p in ("europepmc", "europe_pmc"):
+                    p = "europe_pmc"
+                try:
+                    srcs.append(_PS(p))
+                except Exception:
+                    continue
+
+        papers = _search(query, limit=limit, sources=srcs, with_abstracts=with_abstract)
+        # PaperMetadata contains `published_date: date` → use Pydantic JSON mode
+        # so standard `json.dumps(...)` does not fail.
+        data = [p.model_dump(mode="json") for p in papers]
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        console.print(f"[green]Saved (normalized):[/green] {out}")
+        return
+
+    # Legacy raw mode (source-specific outputs)
+    crossref_mailto = settings.crossref_mailto or settings.contact_email
+    openalex_mailto = settings.openalex_mailto or settings.contact_email
+    ncbi_email = settings.ncbi_email or settings.contact_email
+
+    if src == "arxiv":
+        data = arxiv_search(query=query, max_results=limit, user_agent=ua)
+    elif src == "openalex":
+        data = openalex_search(query=query, per_page=limit, mailto=openalex_mailto, api_key=settings.openalex_api_key, user_agent=ua)
+    elif src in ("s2", "semanticscholar", "semantic_scholar"):
+        data = s2_search(query=query, limit=limit, api_key=settings.s2_api_key)
+    elif src == "crossref":
+        data = crossref_search(query=query, rows=limit, mailto=crossref_mailto, user_agent=ua)
+    elif src == "pubmed":
+        data = pubmed_search(
+            query,
+            retmax=limit,
+            api_key=settings.ncbi_api_key,
+            tool=settings.ncbi_tool,
+            email=ncbi_email,
+            with_abstract=with_abstract,
+        )
+    elif src in ("europepmc", "europe_pmc"):
+        data = europe_pmc_search(query=query, page_size=limit, user_agent=ua)
+    elif src in ("biorxiv", "medrxiv"):
+        recs = biorxiv_search_details(
+            query=query,
+            server=src,
+            cursor=cursor,
+            category=category,
+            user_agent=ua,
+        )
+        data = recs
+    else:
+        raise typer.BadParameter(
+            "source must be one of: arxiv, openalex, s2, crossref, pubmed, europepmc, biorxiv, medrxiv"
+        )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"[green]Saved:[/green] {out}")
+@app.command()
+def parse(
+
+    pdf: Path = typer.Option(..., help="Путь к PDF"),
+    meta: Path = typer.Option(..., help="Путь к meta.json"),
+    out_dir: Path = typer.Option(Path("data/processed/papers"), help="Корневая папка для paper_dir"),
+) -> None:
+    """Парсинг PDF через GROBID и сохранение чанков."""
+    meta_obj = json.loads(meta.read_text(encoding="utf-8"))
+    # best-effort normalize
+    meta_obj = _normalize_meta(meta_obj, fallback_id=pdf.stem, source=str(meta_obj.get("source") or ""))
+    paper_dir = ingest_pdf(pdf_path=pdf, meta=meta_obj, out_dir=out_dir)
+    console.print(f"[green]Paper stored:[/green] {paper_dir}")
+
+
+@app.command("parse-mm")
+def parse_mm(
+    pdf: Path = typer.Option(..., help="Путь к PDF"),
+    meta: Path = typer.Option(..., help="Путь к meta.json"),
+    out_dir: Path = typer.Option(Path("data/processed/papers"), help="Корневая папка для paper_dir"),
+    vlm: bool = typer.Option(True, help="Включить VLM подписи/таблицы/формулы"),
+) -> None:
+    """Парсинг PDF + мультимодальность (страницы/картинки)."""
+    meta_obj = json.loads(meta.read_text(encoding="utf-8"))
+    meta_obj = _normalize_meta(meta_obj, fallback_id=pdf.stem, source=str(meta_obj.get("source") or ""))
+    paper_dir = ingest_pdf_multimodal(pdf_path=pdf, meta=meta_obj, out_dir=out_dir, run_vlm=vlm)
+    console.print(f"[green]Paper stored (mm):[/green] {paper_dir}")
+
+
+@app.command("ingest-arxiv")
+def ingest_arxiv(
+    arxiv_id: str = typer.Argument(..., help="arXiv id или URL (например 2401.01234 или https://arxiv.org/abs/2401.01234)"),
+    raw_dir: Path = typer.Option(Path("data/raw/papers"), help="Куда скачать PDF"),
+    meta_dir: Path = typer.Option(Path("data/raw/metadata"), help="Куда сохранить metadata JSON"),
+    processed_dir: Path = typer.Option(Path("data/processed/papers"), help="Куда сохранить обработанные paper_dir"),
+    multimodal: bool = typer.Option(True, help="Использовать мультимодальный ingest (страницы/таблицы/формулы)."),
+    build_graph: bool = typer.Option(True, help="После ingest собрать temporal+mm граф (TG-MMKG)."),
+    collection_text: Optional[str] = typer.Option(None, help="Qdrant коллекция (текст). По умолчанию из domain config."),
+    collection_mm: Optional[str] = typer.Option(None, help="Qdrant коллекция (multimodal). По умолчанию <text>_mm."),
+) -> None:
+    """Ingestion “в один клик”: скачать arXiv PDF + metadata resolver + ingest pipeline."""
+    arxiv_norm = normalize_arxiv_id(arxiv_id)
+    pdf_path, meta_path = one_click_ingest_arxiv(arxiv_id=arxiv_norm, raw_dir=raw_dir, meta_dir=meta_dir)
+
+    console.print(f"[green]Downloaded:[/green] {pdf_path}")
+    console.print(f"[green]Metadata:[/green] {meta_path}")
+
+    meta_obj = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta_obj = _normalize_meta(
+        meta_obj,
+        fallback_id=f"arxiv:{arxiv_norm}",
+        source="arxiv",
+    )
+    # make id stable and compact
+    meta_obj["id"] = meta_obj.get("doi") and f"doi:{meta_obj['doi']}" or f"arxiv:{arxiv_norm}"
+
+    if multimodal:
+        paper_dir = ingest_pdf_multimodal(pdf_path=pdf_path, meta=meta_obj, out_dir=processed_dir, run_vlm=True)
+    else:
+        paper_dir = ingest_pdf(pdf_path=pdf_path, meta=meta_obj, out_dir=processed_dir)
+
+    console.print(f"[green]Ingested:[/green] {paper_dir}")
+
+    if build_graph:
+        domain_cfg = load_domain_config()
+        ct = collection_text or (domain_cfg.kg.get("collection") if domain_cfg.kg else None) or "demo"
+        cm = collection_mm
+        if cm is None:
+            cm = f"{ct}_mm"
+        build_temporal_and_multimodal(
+            paper_dir=paper_dir,
+            collection_text=ct,
+            collection_mm=cm if multimodal else None,
+            domain=domain_cfg.title,
+        )
+        console.print("[green]TG-MMKG built.[/green]")
+
+
+@app.command("build-tg-mmkg")
+def build_tg_mmkg(
+    paper_dir: Path = typer.Option(..., help="Папка paper_dir (meta.json + chunks.jsonl + optional mm/)"),
+    collection_text: str = typer.Option("demo", help="Qdrant коллекция (текст)"),
+    collection_mm: Optional[str] = typer.Option(None, help="Qdrant коллекция (multimodal). None => skip mm index."),
+    domain: str = typer.Option("Science", help="Доменные подсказки для LLM при извлечении утверждений"),
+    max_chunks_for_triplets: int = typer.Option(16, help="Сколько чанков использовать для извлечения темпоральных триплетов"),
+) -> None:
+    """Строит Temporal KG + (опционально) Multimodal индекс для одной статьи."""
+    build_temporal_and_multimodal(
+        paper_dir=paper_dir,
+        collection_text=collection_text,
+        collection_mm=collection_mm,
+        domain=domain,
+        max_chunks_for_triplets=max_chunks_for_triplets,
+    )
+    console.print("[green]Done.[/green]")
+
+
+@app.command("build-corpus")
+def build_corpus(
+    papers_dir: Path = typer.Option(Path("data/processed/papers"), help="Корневая папка с множеством paper_dir"),
+    collection_text: Optional[str] = typer.Option(None, help="Qdrant коллекция (текст). Default: domain config."),
+    collection_mm: Optional[str] = typer.Option(None, help="Qdrant коллекция (multimodal). Default: <text>_mm."),
+    domain: Optional[str] = typer.Option(None, help="Domain hint. Default: domain config title."),
+    max_papers: int = typer.Option(0, help="Если >0 — ограничить число обработанных статей"),
+    max_chunks_for_triplets: int = typer.Option(16, help="Сколько чанков на статью использовать для извлечения триплетов"),
+) -> None:
+    """Build TG-MMKG for *all* processed papers in a directory.
+
+    This is the recommended entry point for batch ingestion once you have a folder of `paper_dir`.
+    """
+    domain_cfg = load_domain_config()
+    ct = collection_text or (domain_cfg.kg.get("collection") if domain_cfg.kg else None) or "demo"
+    cm = collection_mm
+    if cm is None:
+        cm = f"{ct}_mm"
+    dom = domain or domain_cfg.title
+
+    paper_dirs = sorted([p for p in papers_dir.iterdir() if p.is_dir() and (p / "meta.json").exists()])
+    if max_papers and max_papers > 0:
+        paper_dirs = paper_dirs[:max_papers]
+
+    if not paper_dirs:
+        console.print(f"[yellow]No paper_dir found in {papers_dir}[/yellow]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[cyan]Building corpus:[/cyan] papers={len(paper_dirs)} text_collection={ct} mm_collection={cm}")
+
+    for i, pd in enumerate(paper_dirs, start=1):
+        console.print(f"[dim]({i}/{len(paper_dirs)})[/dim] {pd}")
+        try:
+            pages_path = pd / "mm" / "pages.jsonl"
+            has_mm = pages_path.exists()
+            build_temporal_and_multimodal(
+                paper_dir=pd,
+                collection_text=ct,
+                collection_mm=(cm if has_mm else None),
+                domain=dom,
+                max_chunks_for_triplets=max_chunks_for_triplets,
+            )
+        except Exception as e:
+            console.print(f"[yellow]Skip {pd.name}: {e}[/yellow]")
+
+    console.print("[green]Corpus build finished.[/green]")
+
+
+@app.command("build-kg")
+def build_kg(
+    paper_dir: Path = typer.Option(..., help="Папка paper_dir (meta.json + chunks.jsonl)"),
+    collection: str = typer.Option("demo", help="Qdrant коллекция (текст)"),
+    domain: str = typer.Option("Science", help="Доменные подсказки для LLM"),
+) -> None:
+    """Строит обычный KG в Neo4j и эмбеддинги в Qdrant из paper_dir."""
+    build_from_paper_dir(paper_dir=paper_dir, collection=collection, domain=domain)
+    console.print("[green]Done.[/green]")
+
+
+@app.command()
+def debate(
+    query: str,
+    collection: str = typer.Option("demo", help="Qdrant коллекция (текст)"),
+    domain: str = typer.Option("Science", help="Domain hint for agents"),
+    k: int = typer.Option(8, help="Сколько документов достать в контекст"),
+    max_rounds: int = typer.Option(3, help="Сколько раундов дебатов"),
+    allow_empty_context: bool = typer.Option(
+        False,
+        help=(
+            "Разрешить запуск дебатов без найденного контекста (например, если коллекция ещё не создана). "
+            "По умолчанию команда подскажет, как собрать коллекцию, и завершится с ошибкой."
+        ),
+    ),
+) -> None:
+    """GraphRAG: достать контекст + дебаты агентов -> гипотеза."""
+    try:
+        ctx = retrieve_context(collection=collection, query=query, limit=k)
+    except Exception as e:
+        console.print(
+            "[red]Failed to retrieve context from Qdrant.[/red] "
+            "Make sure Qdrant is running and the collection is built (parse + build-kg)."
+        )
+        console.print(f"[dim]{e}[/dim]")
+        if not allow_empty_context:
+            raise typer.Exit(code=1)
+        ctx = []
+
+    if not ctx and not allow_empty_context:
+        console.print(
+            "[yellow]No context chunks were found.[/yellow] "
+            "Run `top-papers-graph parse ...` and `top-papers-graph build-kg ...` first, "
+            "or pass --allow-empty-context to proceed without retrieval."
+        )
+        raise typer.Exit(code=1)
+    context_text = "\n\n".join(
+        [f"[{c['payload'].get('paper_id')}] {c['payload'].get('text')}" for c in ctx]
+    )
+    res = run_debate(domain=domain, context=context_text, max_rounds=max_rounds)
+    console.print(res.model_dump_json(indent=2, ensure_ascii=False))
+
+
+@app.command("test-hypothesis")
+def test_hypothesis_cmd(
+    hypothesis_json: Path = typer.Option(..., help="Путь к JSON (HypothesisDraft или DebateResult из команды debate)"),
+    collection: str = typer.Option("demo", help="Qdrant коллекция (текст)"),
+    domain: Optional[str] = typer.Option(None, help="Domain hint. Default: domain config title."),
+    k: int = typer.Option(12, help="Сколько чанков извлечь для проверки"),
+) -> None:
+    """Проверить (verification) гипотезу на основе литературы и темпорального KG."""
+    domain_cfg = load_domain_config()
+    dom = domain or domain_cfg.title
+
+    hyp = load_hypothesis_from_json(hypothesis_json)
+    result = test_hypothesis(domain=dom, hypothesis=hyp, collection_text=collection, k=k)
+    console.print(result.model_dump_json(indent=2, ensure_ascii=False))
+
+
+@app.command("refresh-feedback")
+def refresh_feedback(
+    graph_reviews_dir: Path = typer.Option(Path("data/experts/graph_reviews"), help="Папка с graph_reviews (JSON)."),
+    out_path: Path = typer.Option(Path("data/derived/expert_overrides.jsonl"), help="Куда сохранить overrides (JSONL)."),
+) -> None:
+    """Graph reviews → overrides (для мгновенного эффекта на reward/retriever)."""
+    stats = compile_overrides(graph_reviews_dir, out_path)
+    console.print(f"[green]Compiled overrides:[/green] {out_path}")
+    console.print(
+        f"accepted={stats.accepted} rejected={stats.rejected} needs_fix={stats.needs_fix} added={stats.added}"
+    )
+
+
+@app.command("apply-graph-reviews")
+def apply_graph_reviews(
+    graph_reviews_dir: Path = typer.Option(Path("data/experts/graph_reviews"), help="Папка с graph_reviews (JSON)."),
+    overrides_path: Path = typer.Option(Path("data/derived/expert_overrides.jsonl"), help="Куда сохранить overrides (JSONL)."),
+    to_neo4j: bool = typer.Option(False, help="Проставить вердикты/веса на Assertion-нодах в Neo4j."),
+) -> None:
+    """Собрать overrides и (опционально) применить к Neo4j."""
+    stats = compile_overrides(graph_reviews_dir, overrides_path)
+    console.print(f"[green]Compiled overrides:[/green] {overrides_path}")
+    console.print(
+        f"accepted={stats.accepted} rejected={stats.rejected} needs_fix={stats.needs_fix} added={stats.added}"
+    )
+
+    if not to_neo4j:
+        return
+
+    try:
+        tneo = Neo4jTemporalStore()
+        tneo.ensure_schema()
+
+        count = 0
+        for line in overrides_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            tneo.apply_expert_override(
+                subj=str(rec.get("subject")),
+                pred=str(rec.get("predicate")),
+                obj=str(rec.get("object")),
+                verdict=str(rec.get("verdict")),
+                weight=float(rec.get("weight", 0.0)),
+                time_interval=str(rec.get("time_interval", "unknown")),
+                start_date=str(rec.get("start_date", "unknown")),
+                end_date=str(rec.get("end_date", "unknown")),
+                valid_from=str(rec.get("valid_from", rec.get("start_date", "unknown"))),
+                valid_to=str(rec.get("valid_to", "+inf")),
+                time_source=str(rec.get("time_source", "unknown")),
+            )
+            count += 1
+        tneo.close()
+        console.print(f"[green]Applied to Neo4j:[/green] {count} overrides")
+    except Exception as e:
+        console.print(f"[red]Neo4j apply failed:[/red] {e}")
+
+
+@app.command("apply-temporal-corrections")
+def apply_temporal_corrections(
+    corrections_dir: Path = typer.Option(
+        Path("data/experts/temporal_corrections"), help="Папка с temporal_corrections (JSON)."
+    ),
+    dry_run: bool = typer.Option(False, help="Не писать в Neo4j, только показать план изменений."),
+) -> None:
+    """Применить temporal_corrections к Neo4j Temporal KG.
+
+    Т.к. assertion_id включает время, исправление времени реализовано как:
+    old_assertion -[:REPLACED_BY]-> new_assertion.
+    """
+
+    paths = sorted(corrections_dir.glob("**/*.json"))
+    if not paths:
+        console.print(f"[yellow]No JSON files found in {corrections_dir}[/yellow]")
+        return
+
+    tneo = Neo4jTemporalStore()
+    tneo.ensure_schema()
+
+    total = 0
+    created = 0
+    replaced = 0
+
+    for p in paths:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        reviewer_id = str(doc.get("reviewer_id", ""))
+        for corr in doc.get("corrections", []):
+            total += 1
+            old_id = str(corr.get("assertion_id", "")).strip()
+            if not old_id:
+                continue
+
+            details = tneo.get_assertion_details(old_id)
+            if not details:
+                console.print(f"[yellow]Skip:[/yellow] cannot find assertion {old_id}")
+                continue
+
+            try:
+                corrected_time = TimeInterval.model_validate(corr.get("corrected_time"))
+            except Exception as e:
+                console.print(f"[yellow]Skip:[/yellow] invalid corrected_time for {old_id} ({e})")
+                continue
+
+            t = TemporalTriplet(
+                subject=str(details.get("subject")),
+                predicate=str(details.get("predicate")),
+                object=str(details.get("object")),
+                confidence=float(details.get("confidence") or 0.5),
+                polarity=str(details.get("polarity") or "unknown"),
+                time=corrected_time,
+                evidence_quote=str(corr.get("evidence_quote") or details.get("evidence_quote") or "").strip() or None,
+            )
+
+            paper_id = str(details.get("paper_id"))
+            if dry_run:
+                console.print(
+                    f"[cyan]DRY RUN[/cyan] {old_id} -> time {corrected_time.start}-{corrected_time.end} ({corrected_time.granularity})"
+                )
+                continue
+
+            new_id = tneo.upsert_assertion(paper_id=paper_id, t=t, evidence_quote=t.evidence_quote)
+            created += 1
+            tneo.link_replacement(
+                old_id,
+                new_id,
+                rationale=str(corr.get("rationale", "")).strip(),
+                reviewer_id=reviewer_id,
+            )
+            replaced += 1
+
+    tneo.close()
+    console.print(
+        f"[green]Temporal corrections processed[/green]: total={total}, new_assertions={created}, replaced_links={replaced}"
+    )
+
+
+@app.command("prepare-task2-validation")
+def prepare_task2_validation(
+    trajectory: Path = typer.Option(..., help="Путь к YAML артефакту Task 1 (trajectory)."),
+    out_dir: Path = typer.Option(Path("runs/task2_validation"), help="Куда сохранить bundle для эксперта."),
+    multimodal: bool = typer.Option(True, help="Пробовать мультимодальный ingest PDF (страницы + VLM при наличии)."),
+    vlm: bool = typer.Option(True, help="Запускать VLM на страницах PDF, если VLM backend настроен."),
+    edge_mode: str = typer.Option("auto", help="auto|llm_triplets|cooccurrence"),
+    suggest_links: bool = typer.Option(True, help="Добавить scout/suggested_links.json для поиска дополнительных ссылок."),
+    max_papers: int = typer.Option(0, help="Если >0 — ограничить число статей из trajectory YAML."),
+    max_link_queries: int = typer.Option(4, help="Сколько topic/next_question запросов использовать для scout."),
+    remote_lookup: bool = typer.Option(False, help="Разрешить сетевое обогащение метаданных статей и scout-поиск."),
+    g4f_model: str | None = typer.Option(None, "--g4f-model", help="Запустить Task 2 через g4f с указанной моделью."),
+    local_model: str | None = typer.Option(None, "--local-model", help="Запустить Task 2 через локальную Ollama модель."),
+    vlm_backend: str | None = typer.Option(None, "--vlm-backend", help="Переопределить VLM backend для мультимодального шага (например g4f или qwen3_vl)."),
+    vlm_model_id: str | None = typer.Option(None, "--vlm-model-id", help="Явно задать VLM model id для мультимодального шага."),
+    llm_provider: str | None = typer.Option(None, "--llm-provider", help="Явно задать LLM-провайдера для Task 2."),
+    llm_model: str | None = typer.Option(None, "--llm-model", help="Явно задать имя LLM-модели для Task 2."),
+    exclude_yaml: Path | None = typer.Option(None, "--exclude-yaml", help="YAML/JSON со списком статей и паттернов для исключения из Task 2 (анти-leakage фильтр)."),
+    importance_threshold: float = typer.Option(0.0, min=0.0, max=1.0, help="Порог важности триплетов: рёбра ниже порога скрываются в review bundle."),
+) -> None:
+    """Task 2 orchestrator: trajectory YAML -> reference graph + automatic temporal KG + review templates.
+
+    Command is designed for Google Colab / notebook usage and does not require Neo4j/Qdrant.
+    """
+    bundle = build_task2_validation_bundle(
+        trajectory,
+        out_dir=out_dir,
+        include_auto_pipeline=True,
+        multimodal=multimodal,
+        run_vlm=vlm,
+        edge_mode=edge_mode,
+        enable_reference_scout=suggest_links,
+        max_papers=max_papers,
+        max_link_queries=max_link_queries,
+        enable_remote_lookup=remote_lookup,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        g4f_model=g4f_model,
+        local_model=local_model,
+        vlm_backend=vlm_backend,
+        vlm_model_id=vlm_model_id,
+        exclusion_spec=exclude_yaml,
+        importance_threshold=importance_threshold,
+    )
+    console.print(f"[green]Task 2 bundle prepared:[/green] {bundle.bundle_dir}")
+
+
+@app.command("task2-bundle")
+def task2_bundle(
+    trajectory: Path = typer.Option(..., help="Путь к YAML артефакту Task 1 (trajectory)."),
+    out_dir: Path = typer.Option(Path("runs/task2_validation"), help="Куда сохранить bundle для эксперта."),
+    multimodal: bool = typer.Option(True, help="Пробовать мультимодальный ingest PDF (страницы + VLM при наличии)."),
+    vlm: bool = typer.Option(True, help="Запускать VLM на страницах PDF, если VLM backend настроен."),
+    edge_mode: str = typer.Option("auto", help="auto|llm_triplets|cooccurrence"),
+    suggest_links: bool = typer.Option(True, help="Добавить scout/suggested_links.json для поиска дополнительных ссылок."),
+    max_papers: int = typer.Option(0, help="Если >0 — ограничить число статей из trajectory YAML."),
+    max_link_queries: int = typer.Option(4, help="Сколько topic/next_question запросов использовать для scout."),
+    remote_lookup: bool = typer.Option(False, help="Разрешить сетевое обогащение метаданных статей и scout-поиск."),
+    g4f_model: str | None = typer.Option(None, "--g4f-model", help="Запустить Task 2 через g4f с указанной моделью."),
+    local_model: str | None = typer.Option(None, "--local-model", help="Запустить Task 2 через локальную Ollama модель."),
+    vlm_backend: str | None = typer.Option(None, "--vlm-backend", help="Переопределить VLM backend для мультимодального шага (например g4f или qwen3_vl)."),
+    vlm_model_id: str | None = typer.Option(None, "--vlm-model-id", help="Явно задать VLM model id для мультимодального шага."),
+    llm_provider: str | None = typer.Option(None, "--llm-provider", help="Явно задать LLM-провайдера для Task 2."),
+    llm_model: str | None = typer.Option(None, "--llm-model", help="Явно задать имя LLM-модели для Task 2."),
+    exclude_yaml: Path | None = typer.Option(None, "--exclude-yaml", help="YAML/JSON со списком статей и паттернов для исключения из Task 2 (анти-leakage фильтр)."),
+    importance_threshold: float = typer.Option(0.0, min=0.0, max=1.0, help="Порог важности триплетов: рёбра ниже порога скрываются в review bundle."),
+) -> None:
+    """Alias for prepare-task2-validation, kept for notebook and legacy automation compatibility."""
+    bundle = build_task2_validation_bundle(
+        trajectory,
+        out_dir=out_dir,
+        include_auto_pipeline=True,
+        multimodal=multimodal,
+        run_vlm=vlm,
+        edge_mode=edge_mode,
+        enable_reference_scout=suggest_links,
+        max_papers=max_papers,
+        max_link_queries=max_link_queries,
+        enable_remote_lookup=remote_lookup,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        g4f_model=g4f_model,
+        local_model=local_model,
+        vlm_backend=vlm_backend,
+        vlm_model_id=vlm_model_id,
+        exclusion_spec=exclude_yaml,
+        importance_threshold=importance_threshold,
+    )
+    console.print(f"[green]Task 2 bundle prepared:[/green] {bundle.bundle_dir}")
+
+
+@app.command("triage-triplets")
+def triage_triplets_cmd(
+    bundle_dir: Path = typer.Option(..., help="Путь к Task 2 bundle directory."),
+) -> None:
+    """Авто-triage триплетов в Task 2 bundle на accept / reject / review.
+
+    Применяет rule-based эвристики и проставляет ``verdict`` прямо в
+    ``automatic_triplets.csv`` — существующий ``task2_offline_review``
+    подхватит вердикты как pre-fill при ручной разметке.
+    """
+    from .task2_triage import triage_bundle
+
+    console.print(f"[bold]Running triage on[/bold] {bundle_dir} …")
+    summary = triage_bundle(bundle_dir)
+    console.print(
+        f"  [green]{summary.accepted} accept[/green]  "
+        f"[red]{summary.rejected} reject[/red]  "
+        f"[yellow]{summary.review} review[/yellow]  "
+        f"({summary.total} total)"
+    )
+    console.print(
+        f"[green]Verdicts pre-filled into {bundle_dir}/automatic_triplets.csv "
+        f"and report saved to triage_results.json[/green]"
+    )
+
+
+@app.command("train-scorer")
+def train_scorer_cmd(
+    bundle_dir: Path = typer.Option(..., help="Task 2 bundle directory with triage_results.json."),
+    labels: Path | None = typer.Option(None, "--labels", help="Path to triage_verdicts.json exported from HTML client."),
+    out: Path = typer.Option(Path("data/derived/assertion_scorer_weights.json"), help="Where to save trained weights."),
+    n_epochs: int = typer.Option(500, help="Training epochs."),
+    lr: float = typer.Option(0.01, help="Learning rate."),
+) -> None:
+    """Train assertion quality scorer weights from triage verdicts (auto or human-labeled)."""
+    from .temporal.assertion_scorer import (
+        AssertionScorer, compute_corpus_stats, extract_features,
+        train_scorer_weights, save_weights, N_FEATURES,
+    )
+    import csv
+    import numpy as np
+
+    bd = Path(bundle_dir)
+    candidates = [p for p in bd.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    sub = candidates[0] if len(candidates) == 1 else bd
+
+    # Load labels
+    if labels and Path(labels).exists():
+        import json
+        raw = json.loads(Path(labels).read_text(encoding="utf-8"))
+        verdict_map = {r["assertion_id"]: r["verdict"] for r in raw}
+        console.print(f"Loaded {len(verdict_map)} human verdicts from {labels}")
+    else:
+        triage_path = sub / "triage_results.json"
+        if not triage_path.exists():
+            console.print("[red]No triage_results.json found. Run triage-triplets first.[/red]")
+            raise typer.Exit(1)
+        import json
+        triage = json.loads(triage_path.read_text(encoding="utf-8"))
+        verdict_map = {r["assertion_id"]: r["verdict"] for r in triage.get("results", [])}
+        console.print(f"Using {len(verdict_map)} auto-triage verdicts as weak labels")
+
+    # Load triplets
+    csv_path = sub / "automatic_triplets.csv"
+    if not csv_path.exists():
+        console.print(f"[red]No automatic_triplets.csv in {sub}[/red]")
+        raise typer.Exit(1)
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    # Build mock edges for feature extraction
+    from dataclasses import dataclass as _dc, field as _field
+
+    @_dc
+    class _MockNode:
+        term: str = ""
+        doc_freq: int = 1
+
+    @_dc
+    class _MockEdge:
+        source: str = ""
+        target: str = ""
+        predicate: str = ""
+        total_count: int = 1
+        mean_confidence: float = 0.8
+        papers: set = _field(default_factory=set)
+        evidence_quotes: list = _field(default_factory=list)
+        polarity_counts: dict = _field(default_factory=lambda: {"supports": 1, "contradicts": 0, "unknown": 0})
+        features: dict = _field(default_factory=dict)
+
+    # Build feature matrices
+    accept_feats, reject_feats, review_feats = [], [], []
+    nodes_mock: dict = {}
+    edges_mock = []
+
+    for r in rows:
+        e = _MockEdge(
+            source=r.get("subject", ""),
+            target=r.get("object", ""),
+            predicate=r.get("predicate", ""),
+            total_count=1,
+            mean_confidence=float(r.get("mean_confidence") or 0.8),
+            papers={r.get("papers", "paper1")},
+            evidence_quotes=[{"quote": r.get("evidence", "")}] if r.get("evidence") else [],
+            features={"pmi": float(r.get("score") or 0)},
+        )
+        edges_mock.append(e)
+        for term in (e.source, e.target):
+            if term and term not in nodes_mock:
+                nodes_mock[term] = _MockNode(term=term, doc_freq=1)
+
+    stats = compute_corpus_stats(edges_mock, nodes_mock, 3)
+
+    for r, e in zip(rows, edges_mock):
+        aid = r.get("assertion_id", "")
+        v = verdict_map.get(aid, "review")
+        feats = extract_features(e, nodes_mock, stats)
+        if v == "accept":
+            accept_feats.append(feats)
+        elif v == "reject":
+            reject_feats.append(feats)
+        else:
+            review_feats.append(feats)
+
+    fa = np.array(accept_feats) if accept_feats else np.zeros((0, N_FEATURES))
+    fr = np.array(reject_feats) if reject_feats else np.zeros((0, N_FEATURES))
+    fv = np.array(review_feats) if review_feats else None
+
+    console.print(f"Training: {len(accept_feats)} accept, {len(reject_feats)} reject, {len(review_feats)} review")
+
+    w, b, log_data = train_scorer_weights(fa, fr, n_epochs=n_epochs, lr=lr)
+
+    save_weights(out, w, b, training_meta=log_data)
+    console.print(f"[green]Assertion scorer weights saved to {out}[/green]")
+    console.print(f"  Final loss: {log_data['final_loss']:.4f}")
+    console.print(f"  Mean score accept: {log_data['mean_score_accept']:.3f}")
+    console.print(f"  Mean score reject: {log_data['mean_score_reject']:.3f}")
+
+
+@app.command("export-scidatapipe")
+def export_scidatapipe(
+    task1: list[Path] = typer.Option(None, "--task1", help="Путь к Task 1 YAML. Можно передать несколько раз."),
+    task1_dir: list[Path] = typer.Option(None, "--task1-dir", help="Директория с Task 1 YAML. Можно передать несколько раз; файлы ищутся автоматически."),
+    task2: list[Path] = typer.Option(None, "--task2", help="Путь к Task 2 bundle directory/zip. Можно передать несколько раз."),
+    task2_dir: list[Path] = typer.Option(None, "--task2-dir", help="Директория с Task 2 bundle zip/папками. Можно передать несколько раз; bundle ищутся автоматически."),
+    input_dir: list[Path] = typer.Option(None, "--input-dir", help="Смешанная директория, внутри которой bridge сам находит и Task 1 YAML, и Task 2 bundles/zip. Можно передать несколько раз."),
+    processed_papers_dir: list[Path] = typer.Option(None, "--processed-papers-dir", help="Папка processed_papers с mm/pages.jsonl и изображениями. Можно передать несколько раз."),
+    out_dir: Path = typer.Option(Path("data/derived/scidatapipe_export"), help="Куда сохранить нормализованные артефакты и JSONL датасеты."),
+    copy_assets: bool = typer.Option(True, help="Копировать прикреплённые изображения в out_dir/assets."),
+    max_images_per_sample: int = typer.Option(8, help="Сколько изображений максимум прикладывать к одному sample. 0 = все найденные."),
+    max_multimodal_records_per_sample: int = typer.Option(0, help="Сколько multimodal records сериализовать текстом в prompt. 0 = все найденные."),
+    recursive: bool = typer.Option(True, help="Рекурсивно искать YAML и bundle внутри --task1-dir/--task2-dir/--input-dir."),
+    download_papers: bool = typer.Option(False, "--download-papers", help="Скачать статьи по DOI/URL/arXiv/wiki/PMCID/OpenAlex, найденным в Task 1/Task 2 входах."),
+    download_unpaywall_email: str | None = typer.Option(None, "--download-unpaywall-email", help="Email для Unpaywall DOI lookup."),
+    download_root: Path | None = typer.Option(None, "--download-root", help="Куда сохранить кеш скачанных PDF/HTML и download metadata."),
+    download_processed_papers_dir: Path | None = typer.Option(None, "--download-processed-papers-dir", help="Куда складывать processed_papers для скачанных PDF."),
+    ingest_downloaded_papers: bool = typer.Option(True, help="После скачивания PDF сразу прогонять их через ingest/parse-mm и добавлять в processed_papers."),
+    download_multimodal: bool = typer.Option(True, help="Для скачанных PDF использовать multimodal ingest (parse-mm)."),
+    download_run_vlm: bool = typer.Option(True, help="Разрешить VLM этапы для скачанных PDF при multimodal ingest."),
+    prefer_cached_downloads: bool = typer.Option(True, help="Переиспользовать уже скачанные PDF/HTML из download_root, если они есть."),
+    hf_upload: bool = typer.Option(False, "--hf-upload", help="После сборки автоматически загрузить export folder в Hugging Face Hub dataset repo."),
+    hf_repo_id: str | None = typer.Option(None, "--hf-repo-id", help="HF repo id в формате namespace/name, например org/my-dataset."),
+    hf_token: str | None = typer.Option(None, "--hf-token", help="Hugging Face token. Если не передан, будет использован токен из `huggingface-cli login` / окружения."),
+    hf_private: bool | None = typer.Option(None, "--hf-private/--hf-public", help="Создать dataset repo как private/public при необходимости."),
+    hf_path_in_repo: str | None = typer.Option(None, "--hf-path-in-repo", help="Подкаталог внутри HF dataset repo, куда загрузить export."),
+    hf_commit_message: str | None = typer.Option(None, "--hf-commit-message", help="Commit message для загрузки в HF Hub."),
+    hf_commit_description: str | None = typer.Option(None, "--hf-commit-description", help="Commit description для загрузки в HF Hub."),
+    hf_create_repo_if_missing: bool = typer.Option(True, help="Автоматически создать dataset repo, если его ещё нет."),
+    hf_generate_readme: bool = typer.Option(True, help="Сгенерировать базовый README.md dataset card перед upload, если его нет."),
+) -> None:
+    """Экспортирует Task 1/Task 2 экспертные артефакты в scidatapipe-compatible SFT/GRPO JSONL.
+
+    Команда использует схему и нормализацию scidatapipe, умеет пакетно обходить директории
+    с YAML/bundle и по желанию скачивает статьи по идентификаторам из разметки, чтобы сразу
+    пополнить processed_papers мультимодальными страницами.
+    """
+    result = export_scidatapipe_dataset(
+        task1_files=task1 or [],
+        task1_dirs=task1_dir or [],
+        task2_inputs=task2 or [],
+        task2_dirs=task2_dir or [],
+        input_dirs=input_dir or [],
+        out_dir=out_dir,
+        processed_papers_dirs=processed_papers_dir or [],
+        copy_assets=copy_assets,
+        max_images_per_sample=max_images_per_sample,
+        max_multimodal_records_per_sample=max_multimodal_records_per_sample,
+        discover_recursive=recursive,
+        download_referenced_papers=download_papers,
+        download_unpaywall_email=download_unpaywall_email,
+        download_root=download_root,
+        download_processed_papers_dir=download_processed_papers_dir,
+        ingest_downloaded_papers=ingest_downloaded_papers,
+        download_multimodal=download_multimodal,
+        download_run_vlm=download_run_vlm,
+        prefer_cached_downloads=prefer_cached_downloads,
+        hf_upload=hf_upload,
+        hf_repo_id=hf_repo_id,
+        hf_token=hf_token,
+        hf_private=hf_private,
+        hf_path_in_repo=hf_path_in_repo,
+        hf_commit_message=hf_commit_message,
+        hf_commit_description=hf_commit_description,
+        hf_create_repo_if_missing=hf_create_repo_if_missing,
+        hf_generate_readme=hf_generate_readme,
+    )
+    console.print(f"[green]scidatapipe export ready:[/green] {result.output_root}")
+    if result.hf_repo_url:
+        console.print(f"[green]Uploaded to Hugging Face:[/green] {result.hf_repo_url}")
+    console.print(json.dumps(result.stats, ensure_ascii=False, indent=2))
+
+
+@app.command("prepare-task3-hypotheses")
+def prepare_task3_hypotheses(
+    trajectory: Path | None = typer.Option(None, help="Путь к Task 1 / trajectory YAML (опционально)."),
+    query: str = typer.Option("", help="Текстовый запрос для поиска статей (если не передан trajectory)."),
+    identifiers: str = typer.Option("", help="Список DOI/URL/arXiv/OpenAlex/PMID через запятую или перевод строки."),
+    identifiers_file: Path | None = typer.Option(None, help="Файл со списком DOI/URL/идентификаторов (по одному или через запятую)."),
+    processed_dir: Path | None = typer.Option(None, help="Готовая папка processed_papers для офлайн/smoke режима."),
+    out_dir: Path = typer.Option(Path("runs/task3_hypotheses"), help="Куда сохранить bundle Task 3."),
+    domain_id: str = typer.Option("science", help="ID домена (configs/domains/<id>.yaml)."),
+    search_limit: int = typer.Option(25, help="Сколько результатов запрашивать при поиске статей."),
+    top_papers: int = typer.Option(12, help="Сколько статей максимум брать в pipeline."),
+    top_hypotheses: int = typer.Option(8, help="Сколько итоговых гипотез сохранить."),
+    candidate_top_k: int = typer.Option(16, help="Сколько graph-кандидатов рассмотреть до финального ранжирования."),
+    multimodal: bool = typer.Option(True, help="Включить multimodal ingest PDF (страницы/таблицы/figure evidence)."),
+    vlm: bool = typer.Option(True, help="Разрешить VLM-этапы Task 3 (captioning, candidate-specific analysis)."),
+    edge_mode: str = typer.Option("auto", help="auto|llm_triplets|cooccurrence"),
+    link_backend: str = typer.Option("auto", help="auto|pygt_temporal|heuristic|tgn"),
+    link_top_k: int = typer.Option(24, help="Сколько temporal link predictions сохранить."),
+    annoy_metric: str = typer.Option("angular", help="Метрика Annoy: angular|euclidean|manhattan|dot."),
+    annoy_n_trees: int = typer.Option(32, help="Сколько деревьев строить в Annoy."),
+    g4f_model: str | None = typer.Option(None, "--g4f-model", help="Явно использовать g4f с указанной моделью."),
+    local_model: str | None = typer.Option(None, "--local-model", help="Явно использовать локальную Ollama модель."),
+    llm_provider: str | None = typer.Option(None, "--llm-provider", help="Явно задать текстовый LLM provider для Task 3."),
+    llm_model: str | None = typer.Option(None, "--llm-model", help="Явно задать текстовую LLM модель для Task 3."),
+    vlm_backend: str | None = typer.Option(None, "--vlm-backend", help="Переопределить VLM backend (например g4f, qwen2_vl, qwen3_vl)."),
+    vlm_model_id: str | None = typer.Option(None, "--vlm-model-id", help="Явно задать VLM model id для HF/local backend."),
+) -> None:
+    """Task 3 orchestrator: papers/query/trajectory -> temporal multimodal KG -> ranked hypotheses."""
+
+    parsed_identifiers = []
+    if identifiers.strip():
+        parsed_identifiers = [item.strip() for item in re.split(r"[,;\n]", identifiers) if item.strip()]
+
+    bundle = prepare_task3_hypothesis_bundle(
+        trajectory=trajectory,
+        query=query,
+        identifiers=parsed_identifiers,
+        identifiers_file=identifiers_file,
+        processed_dir=processed_dir,
+        out_dir=out_dir,
+        domain_id=domain_id,
+        search_limit=search_limit,
+        top_papers=top_papers,
+        top_hypotheses=top_hypotheses,
+        candidate_top_k=candidate_top_k,
+        include_multimodal=multimodal,
+        run_vlm=vlm,
+        edge_mode=edge_mode,
+        link_prediction_backend=link_backend,
+        link_prediction_top_k=link_top_k,
+        annoy_metric=annoy_metric,
+        annoy_n_trees=annoy_n_trees,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        g4f_model=g4f_model,
+        local_model=local_model,
+        vlm_backend=vlm_backend,
+        vlm_model_id=vlm_model_id,
+    )
+    console.print(f"[green]Task 3 bundle prepared:[/green] {bundle.bundle_dir}")
+
+
+@app.command("task3-bundle")
+def task3_bundle(
+    trajectory: Path | None = typer.Option(None, help="Путь к Task 1 / trajectory YAML (опционально)."),
+    query: str = typer.Option("", help="Текстовый запрос для поиска статей (если не передан trajectory)."),
+    identifiers: str = typer.Option("", help="Список DOI/URL/arXiv/OpenAlex/PMID через запятую или перевод строки."),
+    identifiers_file: Path | None = typer.Option(None, help="Файл со списком DOI/URL/идентификаторов (по одному или через запятую)."),
+    processed_dir: Path | None = typer.Option(None, help="Готовая папка processed_papers для офлайн/smoke режима."),
+    out_dir: Path = typer.Option(Path("runs/task3_hypotheses"), help="Куда сохранить bundle Task 3."),
+    domain_id: str = typer.Option("science", help="ID домена (configs/domains/<id>.yaml)."),
+    search_limit: int = typer.Option(25, help="Сколько результатов запрашивать при поиске статей."),
+    top_papers: int = typer.Option(12, help="Сколько статей максимум брать в pipeline."),
+    top_hypotheses: int = typer.Option(8, help="Сколько итоговых гипотез сохранить."),
+    candidate_top_k: int = typer.Option(16, help="Сколько graph-кандидатов рассмотреть до финального ранжирования."),
+    multimodal: bool = typer.Option(True, help="Включить multimodal ingest PDF (страницы/таблицы/figure evidence)."),
+    vlm: bool = typer.Option(True, help="Разрешить VLM-этапы Task 3 (captioning, candidate-specific analysis)."),
+    edge_mode: str = typer.Option("auto", help="auto|llm_triplets|cooccurrence"),
+    link_backend: str = typer.Option("auto", help="auto|pygt_temporal|heuristic|tgn"),
+    link_top_k: int = typer.Option(24, help="Сколько temporal link predictions сохранить."),
+    annoy_metric: str = typer.Option("angular", help="Метрика Annoy: angular|euclidean|manhattan|dot."),
+    annoy_n_trees: int = typer.Option(32, help="Сколько деревьев строить в Annoy."),
+    g4f_model: str | None = typer.Option(None, "--g4f-model", help="Явно использовать g4f с указанной моделью."),
+    local_model: str | None = typer.Option(None, "--local-model", help="Явно использовать локальную Ollama модель."),
+    llm_provider: str | None = typer.Option(None, "--llm-provider", help="Явно задать текстовый LLM provider для Task 3."),
+    llm_model: str | None = typer.Option(None, "--llm-model", help="Явно задать текстовую LLM модель для Task 3."),
+    vlm_backend: str | None = typer.Option(None, "--vlm-backend", help="Переопределить VLM backend (например g4f, qwen2_vl, qwen3_vl)."),
+    vlm_model_id: str | None = typer.Option(None, "--vlm-model-id", help="Явно задать VLM model id для HF/local backend."),
+) -> None:
+    """Alias for prepare-task3-hypotheses, kept for notebook/automation symmetry."""
+
+    parsed_identifiers = []
+    if identifiers.strip():
+        parsed_identifiers = [item.strip() for item in re.split(r"[,;\n]", identifiers) if item.strip()]
+
+    bundle = prepare_task3_hypothesis_bundle(
+        trajectory=trajectory,
+        query=query,
+        identifiers=parsed_identifiers,
+        identifiers_file=identifiers_file,
+        processed_dir=processed_dir,
+        out_dir=out_dir,
+        domain_id=domain_id,
+        search_limit=search_limit,
+        top_papers=top_papers,
+        top_hypotheses=top_hypotheses,
+        candidate_top_k=candidate_top_k,
+        include_multimodal=multimodal,
+        run_vlm=vlm,
+        edge_mode=edge_mode,
+        link_prediction_backend=link_backend,
+        link_prediction_top_k=link_top_k,
+        annoy_metric=annoy_metric,
+        annoy_n_trees=annoy_n_trees,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        g4f_model=g4f_model,
+        local_model=local_model,
+        vlm_backend=vlm_backend,
+        vlm_model_id=vlm_model_id,
+    )
+    console.print(f"[green]Task 3 bundle prepared:[/green] {bundle.bundle_dir}")
+
+
+@app.command("pybamm-fastcharge")
+def pybamm_fastcharge(
+    profile: str = typer.Option("baseline_cc", help="baseline_cc|proposed_two_stage|..."),
+    profiles_dir: Path | None = typer.Option(
+        None,
+        "--profiles-dir",
+        envvar="CHARGING_PROFILES_DIR",
+        help="Папка с YAML профилями зарядки (можно задать через CHARGING_PROFILES_DIR)",
+    ),
+    out_dir: Path = typer.Option(Path("results/pybamm/run"), help="Куда сохранить результаты"),
+) -> None:
+    """Запуск симуляции PyBaMM для профиля зарядки (пример: battery_fastcharge)."""
+    from .experiments.pybamm_fastcharge import run_simulation
+
+    out = run_simulation(profile_name=profile, out_dir=out_dir, config_dir=profiles_dir)
+    console.print(f"[green]Saved metrics:[/green] {out}")
+
+
+@app.command("import-top-papers")
+def import_top_papers(
+    inp: Path = typer.Option(..., help="JSON файл, который выдаёт top-papers-bot"),
+    out_dir: Path = typer.Option(Path("configs/top_papers_meta"), help="Куда сохранить meta-файлы"),
+) -> None:
+    """Импорт JSON из top-papers-bot в meta-файлы SciReason."""
+    from .integrations.top_papers_import import export_meta_files
+
+    files = export_meta_files(inp, out_dir)
+    console.print(f"[green]Generated meta files:[/green] {len(files)} → {out_dir}")
+
+
+@app.command("run")
+def run_cmd(
+    query: str = typer.Option(..., help="Пользовательский запрос (topic/query)."),
+    domain_id: str = typer.Option(
+        None,  # type: ignore[arg-type]
+        help="ID домена (configs/domains/<id>.yaml). По умолчанию берётся из .env (DOMAIN_ID) или science.",
+    ),
+    sources: str = typer.Option(
+        "all",
+        help="Источники через запятую: all|openalex,semantic_scholar,crossref,arxiv,pubmed,europe_pmc,biorxiv.",
+    ),
+    search_limit: int = typer.Option(50, help="Сколько результатов запросить у источников."),
+    top_papers: int = typer.Option(20, help="Сколько лучших статей взять в пайплайн."),
+    out_dir: Path = typer.Option(Path("runs"), help="Куда сохранить артефакты запуска."),
+    multimodal: bool = typer.Option(False, help="Извлекать страницы/картинки (MM) при наличии зависимостей."),
+    no_llm_hypotheses: bool = typer.Option(False, help="Не использовать LLM для переформулировки гипотез."),
+    no_report: bool = typer.Option(False, help="Не генерировать интерактивный HTML-отчёт (граф + саммари статей)."),
+
+    # --- LLM overrides (CLI > env/config defaults) ---
+    llm: Optional[str] = typer.Option(
+        None,
+        "--llm",
+        help=(
+            "Переопределить LLM одним флагом. Форматы: 'g4f:deepseek-r1', 'g4f:gpt-4o-mini', "
+            "'local:llama3.2' (Ollama), 'ollama:llama3.2', или 'openai/gpt-4o-mini' (LiteLLM)."
+        ),
+    ),
+    g4f_model: Optional[str] = typer.Option(
+        None,
+        "--g4f-model",
+        help="Явно использовать g4f с указанной моделью (например deepseek-r1).",
+    ),
+    local_model: Optional[str] = typer.Option(
+        None,
+        "--local-model",
+        help="Явно использовать локальную Ollama модель (например llama3.2).",
+    ),
+    llm_provider: Optional[str] = typer.Option(
+        None,
+        "--llm-provider",
+        help="Явно задать провайдера (g4f|ollama|openai|anthropic|...).",
+    ),
+    llm_model: Optional[str] = typer.Option(
+        None,
+        "--llm-model",
+        help="Явно задать имя модели провайдера.",
+    ),
+    smol_model_backend: Optional[str] = typer.Option(
+        None,
+        "--smol-model-backend",
+        help="smolagents model backend (scireason|transformers|g4f). Overrides SMOL_MODEL_BACKEND.",
+    ),
+    smol_model_id: Optional[str] = typer.Option(
+        None,
+        "--smol-model-id",
+        help="HF model id/path for smolagents TransformersModel. Overrides SMOL_MODEL_ID.",
+    ),
+) -> None:
+    """Полностью автоматический пайплайн: query → papers → temporal KG → hypotheses."""
+    # ---- Apply LLM overrides ----
+    def _apply_llm_overrides() -> None:
+        # 1) single-flag format
+        if llm:
+            raw = llm.strip()
+
+            # Accept provider/model as "provider:model" or "provider/model"
+            if ":" in raw:
+                prov, model = raw.split(":", 1)
+            elif "/" in raw:
+                prov, model = raw.split("/", 1)
+            else:
+                # No separator -> assume g4f model
+                prov, model = "g4f", raw
+
+            prov = prov.strip().lower()
+            model = model.strip()
+
+            if prov in {"local", "ollama"}:
+                settings.llm_provider = "ollama"
+                settings.llm_model = model
+            elif prov == "g4f":
+                settings.llm_provider = "g4f"
+                settings.llm_model = model
+            else:
+                # LiteLLM-style provider/model
+                settings.llm_provider = prov
+                settings.llm_model = model
+            return
+
+        # 2) convenience flags
+        if local_model:
+            settings.llm_provider = "ollama"
+            settings.llm_model = local_model.strip()
+            return
+
+        if g4f_model:
+            settings.llm_provider = "g4f"
+            settings.llm_model = g4f_model.strip()
+            return
+
+        # 3) explicit provider/model flags
+        if llm_provider:
+            settings.llm_provider = llm_provider.strip()
+        if llm_model:
+            settings.llm_model = llm_model.strip()
+
+    # Apply overrides (CLI > env/config defaults)
+    _apply_llm_overrides()
+
+    # smolagents model overrides (CLI > env)
+    if smol_model_backend:
+        settings.smol_model_backend = smol_model_backend.strip()
+    if smol_model_id:
+        settings.smol_model_id = smol_model_id.strip()
+
+    console.print(
+        f"[bold]LLM:[/bold] {settings.llm_provider}/{settings.llm_model}  |  "
+        f"[bold]Embeddings:[/bold] {getattr(settings, 'embed_provider', 'hash')}"
+    )
+
+    did = domain_id or settings.domain_id or "science"
+    src_list = None
+    if sources.strip().lower() != "all":
+        src_list = [s.strip() for s in sources.split(",") if s.strip()]
+
+    run_path = run_pipeline(
+        query=query,
+        domain_id=did,
+        sources=src_list,
+        search_limit=search_limit,
+        top_papers=top_papers,
+        run_dir=out_dir,
+        include_multimodal=multimodal,
+        use_llm_for_hypotheses=not no_llm_hypotheses,
+        generate_report=not no_report,
+    )
+    console.print(f"[bold green]Artifacts saved:[/bold green] {run_path}")
+
+
+@app.command("export-temporal-events")
+def export_temporal_events(
+    out: Path = typer.Option(Path("runs/temporal_events.json"), help="Where to save the exported event stream JSON."),
+    limit: int = typer.Option(5000, help="Maximum number of Neo4j events to export."),
+) -> None:
+    """Export the Event layer from Neo4j for temporal model training/evaluation."""
+    store = Neo4jTemporalStore()
+    try:
+        rows = store.export_event_stream(limit=limit)
+    finally:
+        store.close()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"[green]Exported events:[/green] {out} (n={len(rows)})")
+
+
+@app.command("train-tgn")
+def train_tgn(
+    temporal_kg_json: Path = typer.Option(..., help="Path to temporal_kg.json produced by the pipeline."),
+    out: Path = typer.Option(Path("runs/tgn_predictions.json"), help="Where to save top temporal link predictions."),
+    top_k: int = typer.Option(20, help="Number of temporal link predictions to keep."),
+) -> None:
+    """Train/evaluate the lightweight TGNN-style predictor on a temporal KG artifact."""
+    from .temporal.temporal_kg_builder import TemporalKnowledgeGraph, EdgeStats, NodeStats
+    from .tgnn.event_dataset import build_event_stream, chronological_split, event_stats
+    from .tgnn.tgn_link_prediction import TGNLinkPredConfig, tgn_link_prediction
+
+    raw = json.loads(temporal_kg_json.read_text(encoding="utf-8"))
+    kg = TemporalKnowledgeGraph(meta=dict(raw.get("meta") or {}))
+    for n in raw.get("nodes", []):
+        term = str(n.get("term") or "")
+        if not term:
+            continue
+        kg.nodes[term] = NodeStats(term=term, doc_freq=int(n.get("doc_freq") or 0), yearly_doc_freq=dict(n.get("yearly_doc_freq") or {}))
+    for e in raw.get("edges", []):
+        edge = EdgeStats(
+            source=str(e.get("source") or ""),
+            target=str(e.get("target") or ""),
+            predicate=str(e.get("predicate") or "may_relate_to"),
+            directed=bool(e.get("directed", True)),
+            total_count=int(e.get("total_count") or 0),
+            yearly_count={int(k): int(v) for k, v in dict(e.get("yearly_count") or {}).items()},
+            confidence_sum=float(e.get("mean_confidence") or 0.0) * max(1, int(e.get("total_count") or 1)),
+            confidence_n=max(1, int(e.get("total_count") or 1)),
+            polarity_counts=dict(e.get("polarity_counts") or {"supports": 0, "contradicts": 0, "unknown": 0}),
+            papers=set(e.get("papers") or []),
+            evidence_quotes=list(e.get("evidence_quotes") or []),
+            features=dict(e.get("features") or {}),
+            score=float(e.get("score") or 0.0),
+        )
+        kg.edges.append(edge)
+
+    events = build_event_stream(kg)
+    train_events, valid_events, test_events = chronological_split(events)
+    preds = tgn_link_prediction(
+        train_events + valid_events,
+        top_k=top_k,
+        config=TGNLinkPredConfig(
+            recent_window_years=int(getattr(settings, "hyp_tgnn_recent_window_years", 3) or 3),
+            recency_half_life_years=float(getattr(settings, "hyp_tgnn_half_life_years", 2.0) or 2.0),
+            min_candidate_score=float(getattr(settings, "hyp_tgnn_min_candidate_score", 0.05) or 0.05),
+        ),
+    )
+    payload = {
+        "stats": {
+            **event_stats(events),
+            "train_events": len(train_events),
+            "valid_events": len(valid_events),
+            "test_events": len(test_events),
+        },
+        "predictions": [
+            {"source": u, "target": v, "score": score}
+            for u, v, score in preds
+        ],
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"[green]Saved TGNN predictions:[/green] {out}")
+
+
+@app.command("demo-run")
+def demo_run_cmd(
+    query: str = typer.Option("temporal knowledge graph hypothesis", help="Demo query (offline)."),
+    edge_mode: str = typer.Option("cooccurrence", help="cooccurrence|llm_triplets"),
+    out_dir: Path = typer.Option(Path("runs"), help="Where to write demo artifacts."),
+    domain_id: str = typer.Option(None, help="Domain config id (defaults to env DOMAIN_ID or science)."),
+    no_llm_hypotheses: bool = typer.Option(False, help="Disable LLM rewriting for hypotheses."),
+    tgnn: bool = typer.Option(True, help="Enable TGNN/TGN-style temporal link prediction (default on)."),
+    gnn: bool = typer.Option(False, help="Enable optional static GNN baseline (requires '.[gnn]')."),
+    agent_backend: Optional[str] = typer.Option(
+        None,
+        help="Override HYP_AGENT_BACKEND for this run (internal|smolagents).",
+    ),
+    llm_provider: Optional[str] = typer.Option(None, help="Override LLM_PROVIDER for this run (e.g. mock)."),
+    llm_model: Optional[str] = typer.Option(None, help="Override LLM_MODEL for this run."),
+    smol_model_backend: Optional[str] = typer.Option(
+        None,
+        "--smol-model-backend",
+        help="smolagents model backend (scireason|transformers|g4f). Overrides SMOL_MODEL_BACKEND.",
+    ),
+    smol_model_id: Optional[str] = typer.Option(
+        None,
+        "--smol-model-id",
+        help="HF model id/path for smolagents TransformersModel. Overrides SMOL_MODEL_ID.",
+    ),
+) -> None:
+    """Offline demo pipeline: build temporal KG + hypotheses from a tiny built-in corpus.
+
+    This command is used for smoke tests and for the first classroom run without network/services.
+    """
+
+    if llm_provider:
+        settings.llm_provider = llm_provider.strip()
+    if llm_model:
+        settings.llm_model = llm_model.strip()
+    if smol_model_backend:
+        settings.smol_model_backend = smol_model_backend.strip()
+    if smol_model_id:
+        settings.smol_model_id = smol_model_id.strip()
+
+    settings.hyp_tgnn_enabled = bool(tgnn)
+    if gnn:
+        settings.hyp_gnn_enabled = True
+
+    if agent_backend:
+        settings.hyp_agent_backend = agent_backend.strip()
+
+    did = domain_id or settings.domain_id or "science"
+    run_path = run_demo_pipeline(
+        query=query,
+        domain_id=did,
+        edge_mode=edge_mode,
+        out_dir=out_dir,
+        use_llm_for_hypotheses=not no_llm_hypotheses,
+    )
+    console.print(f"[bold green]Demo artifacts saved:[/bold green] {run_path}")
+
+
+@app.command("smoke-all")
+def smoke_all(
+    out_dir: Path = typer.Option(Path("runs"), help="Where to write artifacts."),
+    include_g4f: bool = typer.Option(
+        False,
+        help="Also run smoke with LLM_PROVIDER=g4f (requires '.[g4f]' and internet; can be unstable).",
+    ),
+    smol_model_backend: Optional[str] = typer.Option(
+        None,
+        "--smol-model-backend",
+        help="smolagents model backend for smolagents runs (scireason|transformers|g4f).",
+    ),
+    smol_model_id: Optional[str] = typer.Option(
+        None,
+        "--smol-model-id",
+        help="HF model id/path for smolagents TransformersModel.",
+    ),
+) -> None:
+    """Run an offline smoke matrix for key pipeline branches."""
+
+    # Prefer deterministic offline mode by default.
+    llm_providers = ["mock"]
+    if include_g4f:
+        llm_providers.append("g4f")
+
+    # Try both agent backends if smolagents is available.
+    import importlib.util
+
+    agent_backends = ["internal"]
+    if importlib.util.find_spec("smolagents") is not None:
+        agent_backends.append("smolagents")
+
+    # smolagents model overrides (CLI > env)
+    if smol_model_backend:
+        settings.smol_model_backend = smol_model_backend.strip()
+    if smol_model_id:
+        settings.smol_model_id = smol_model_id.strip()
+
+    combos = [
+        ("cooccurrence", True, False),
+        ("cooccurrence", False, False),
+        ("llm_triplets", True, False),
+        ("llm_triplets", False, False),
+        # Optional GNN branch (best-effort; will fall back if PyG isn't installed)
+        ("cooccurrence", True, True),
+        ("cooccurrence", False, True),
+    ]
+    for llm_provider in llm_providers:
+        settings.llm_provider = llm_provider
+        settings.llm_model = "mock" if llm_provider == "mock" else (settings.llm_model or "auto")
+
+        for agent_backend in agent_backends:
+            settings.hyp_agent_backend = agent_backend
+            for edge_mode, no_llm, gnn in combos:
+                settings.hyp_gnn_enabled = bool(gnn)
+                console.print(
+                    f"[cyan]Smoke[/cyan] llm_provider={llm_provider} agent_backend={agent_backend} edge_mode={edge_mode} no_llm_hypotheses={no_llm} gnn={gnn}"
+                )
+                rp = run_demo_pipeline(
+                    query="demo smoke",
+                    domain_id=settings.domain_id or "science",
+                    edge_mode=edge_mode,
+                    out_dir=out_dir,
+                    use_llm_for_hypotheses=not no_llm,
+                )
+                # Ensure key artifacts exist
+                for f in ["paper_records.json", "temporal_kg.json", "hypotheses.json"]:
+                    p = rp / f
+                    if not p.exists():
+                        raise RuntimeError(f"Smoke failed: missing {p}")
+    console.print("[bold green]Smoke-all: OK[/bold green]")
+
+
+@app.command("bot")
+def bot_cmd(
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Токен Telegram-бота. По умолчанию берётся из .env (TELEGRAM_BOT_TOKEN).",
+    ),
+    workers: int = typer.Option(2, help="Сколько запросов обрабатывать параллельно (очередь)."),
+    top_papers: int = typer.Option(10, help="Сколько лучших статей брать в пайплайн на запрос."),
+    search_limit: int = typer.Option(30, help="Сколько результатов запрашивать у источников."),
+) -> None:
+    """Запустить Telegram-бота: тема на русском → HTML-отчёт (граф + русские саммари)."""
+
+    from .pipeline.tg_bot import run_bot
+
+    console.print("[bold cyan]Starting Telegram bot[/bold cyan] (Ctrl+C to stop)")
+    try:
+        run_bot(
+            token=token,
+            workers=workers,
+            top_papers=top_papers,
+            search_limit=search_limit,
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command("web")
+def web_cmd(
+    host: Optional[str] = typer.Option(
+        None, "--host", help="Хост для сервера. По умолчанию из .env (WEB_HOST)."
+    ),
+    port: Optional[int] = typer.Option(
+        None, "--port", help="Порт для сервера. По умолчанию из .env (WEB_PORT)."
+    ),
+    reload: bool = typer.Option(
+        False, "--reload", help="Автоперезагрузка при изменении кода (для разработки)."
+    ),
+) -> None:
+    """Запустить веб-сайт: регистрация, отчёты, запуск пайплайна, дашборд.
+
+    Общая БД с ботом: если задан ``DATABASE_URL`` (Postgres) — используется он,
+    иначе SQLite (по умолчанию). Отчёты из бота и сайта попадают в одну историю.
+    """
+
+    try:
+        import uvicorn  # noqa: F401
+    except ImportError:
+        console.print(
+            "[red]Web-зависимости не установлены. Установите: "
+            "pip install -e '.[web]'[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    from .config import settings
+
+    _host = host or settings.web_host
+    _port = int(port if port is not None else settings.web_port)
+
+    console.print(
+        f"[bold cyan]Starting web site[/bold cyan] on "
+        f"http://{_host}:{_port} (Ctrl+C to stop)"
+    )
+
+    import uvicorn
+
+    uvicorn.run(
+        "scireason.webapp.app:app",
+        host=_host,
+        port=_port,
+        reload=reload,
+    )
+
+
+if __name__ == "__main__":
+    app()

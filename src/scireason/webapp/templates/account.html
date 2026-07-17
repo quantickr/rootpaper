@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Аккаунт{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Аккаунт</h1>
+  <table>
+    <tbody>
+      <tr><th>Email</th><td>{{ user.email or "— (вход через Telegram)" }}
+        {% if user.email and not user.email_verified %}<span class="pill">не подтверждён</span>{% endif %}
+      </td></tr>
+      <tr><th>Роль</th><td>{{ user.role }}</td></tr>
+      <tr><th>Telegram</th><td>
+        {% if user.tg_user_id %}
+          привязан{% if user.tg_username %} (@{{ user.tg_username }}){% endif %}
+        {% else %}
+          не привязан
+        {% endif %}
+      </td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Telegram</h2>
+  {% if user.tg_user_id %}
+    <p class="muted">Ваш Telegram привязан к аккаунту. История отчётов из бота и с сайта объединена.</p>
+    {% if user.email %}
+    <form method="post" action="/account/unlink-telegram">
+      <button class="btn-ghost" type="submit">Отвязать Telegram</button>
+    </form>
+    {% endif %}
+  {% else %}
+    <p class="muted">Привяжите Telegram, чтобы отчёты из бота попадали в одну историю.</p>
+    {% if bot_username %}
+    <div id="tg-login"></div>
+    <script async src="https://telegram.org/js/telegram-widget.js?22"
+            data-telegram-login="{{ bot_username }}"
+            data-size="large"
+            data-auth-url="{{ cfg.web_base_url.rstrip('/') }}/auth/telegram"
+            data-request-access="write"></script>
+    {% else %}
+    <p class="muted">Telegram Login Widget не настроен (нет TELEGRAM_BOT_USERNAME).</p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

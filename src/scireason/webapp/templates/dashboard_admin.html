@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Админ-дашборд{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Статистика системы <span class="badge">admin</span></h1>
+  <div class="grid">
+    <div class="stat"><div class="num">{{ stats.users }}</div><div class="lbl">Пользователей</div></div>
+    <div class="stat"><div class="num">{{ stats.verified_users }}</div><div class="lbl">Подтвердили email</div></div>
+    <div class="stat"><div class="num">{{ stats.tg_linked_users }}</div><div class="lbl">Привязан Telegram</div></div>
+    <div class="stat"><div class="num">{{ stats.reports }}</div><div class="lbl">Отчётов всего</div></div>
+    <div class="stat"><div class="num">{{ total_mb }}</div><div class="lbl">МБ данных</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Отчёты по источнику</h2>
+  <table>
+    <thead><tr><th>Источник</th><th>Отчётов</th></tr></thead>
+    <tbody>
+      {% for origin, n in stats.by_origin.items() %}
+      <tr><td><span class="pill">{{ origin }}</span></td><td class="muted">{{ n }}</td></tr>
+      {% else %}
+      <tr><td colspan="2" class="muted">Пока нет данных</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if stats.top_queries %}
+<div class="card">
+  <h2>Топ запросов</h2>
+  <table>
+    <thead><tr><th>Запрос</th><th>Раз</th></tr></thead>
+    <tbody>
+      {% for q, n in stats.top_queries %}
+      <tr><td>{{ q }}</td><td class="muted">{{ n }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Override для запуска сайта + бота на ОБЩЕЙ SQLite (без Postgres).
+# docker compose автоматически подхватывает этот файл поверх docker-compose.yml.
+#
+# Зачем: в базовом docker-compose.yml сервисы web/bot жёстко указывают
+# DATABASE_URL на Postgres и зависят от него. Здесь мы это переопределяем:
+#  * DATABASE_URL="" -> фабрика хранилища выбирает SQLite;
+#  * SQLITE_DB_PATH указывает на файл на общем томе bot_runs;
+#  * depends_on override'ится на пустой (Postgres не нужен).
+#
+# Запуск сайта + бота на SQLite:
+#   docker compose --profile web up --build web bot
+# Только сайт:
+#   docker compose --profile web up --build web
+#
+# Если захочешь Postgres — просто удали/переименуй этот файл и подними
+# профиль bot целиком: docker compose --profile bot up --build.
+
+services:
+  web:
+    environment:
+      # Пусто -> SQLite (см. store/factory.py). Общий файл с ботом.
+      DATABASE_URL: ""
+      SQLITE_DB_PATH: /app/runs/tpg.sqlite3
+      GRAPH_BACKEND: none
+    # !reset очищает depends_on из базового файла (иначе compose их мержит,
+    # и сайт ждал бы Postgres, который в SQLite-режиме не нужен).
+    depends_on: !reset []
+
+  bot:
+    environment:
+      DATABASE_URL: ""
+      SQLITE_DB_PATH: /app/runs/tpg.sqlite3
+      GRAPH_BACKEND: none
+    depends_on: !reset []

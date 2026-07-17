@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: hf-top-papers-qwen3vl-8b-sft-grpo-smoke-g2-2
+desc: Smoke test for Qwen3-VL-8B SFT+GRPO DataSphere pipeline with CUDA/BF16 preflight,
+  tiny steps and no Hugging Face upload.
+cmd: bash experiments/vlm_finetuning/datasphere/bin/run_hf_top_papers_sft_grpo_full.sh
+env:
+  python:
+    type: manual
+    version: '3.10'
+    requirements-file: experiments/vlm_finetuning/datasphere/requirements.txt
+    local-paths:
+    - experiments/vlm_finetuning/
+    - data/
+    - examples/
+    pip:
+      extra-index-urls:
+      - https://download.pytorch.org/whl/cu121
+  vars:
+  - HF_DATASET_ID: top-papers/top-papers-graph-experts-data
+  - HF_DATASET_REVISION: main
+  - HF_DATASET_SOURCE_MODE: export
+  - HF_DATASET_EXPORT_SUBDIR: exports/colab-run-001
+  - HF_DATASET_SPLIT: validation
+  - EVAL_RATIO: '0.10'
+  - MAX_IMAGES_PER_EXAMPLE_SFT: 3
+  - MAX_IMAGES_PER_EXAMPLE_GRPO: 2
+  - BASE_MODEL: Qwen/Qwen3-VL-8B-Instruct
+  - OUT_PREFIX: hf_top_papers_qwen3vl_8b_smoke
+  - HF_UPLOAD_AFTER_TRAINING: '0'
+  - HF_REPO_ID: top-papers/Qwen3-VL-8B-Instruct-scireason
+  - HF_REPO_TYPE: model
+  - HF_REVISION: main
+  - HF_UPLOAD_PATH_PREFIX: ''
+  - HF_UPLOAD_TIMEOUT_HOURS: 1
+  - BUDGET_RUB: 100000
+  - BUDGET_RESERVE_RUB: 5000
+  - BUDGET_SHUTDOWN_MARGIN_SECONDS: 900
+  - G2_2_RUB_PER_HOUR: 1085.76
+  - DATA_TIMEOUT_HOURS: 3
+  - SFT_TIMEOUT_HOURS: 4
+  - GRPO_TIMEOUT_HOURS: 4
+  - MAX_SFT_STEPS: 20
+  - MAX_GRPO_STEPS: 5
+  - SFT_EPOCHS: 4
+  - GRPO_EPOCHS: 1
+  - SFT_LR: 7e-5
+  - SFT_WARMUP_RATIO: '0.05'
+  - SFT_LR_SCHEDULER: cosine
+  - SFT_WEIGHT_DECAY: '0.01'
+  - SFT_MAX_GRAD_NORM: '0.3'
+  - SFT_DDP_TIMEOUT_SECONDS: '7200'
+  - SFT_MAX_TEXT_CHARS: '12000'
+  - SFT_LORA_R: 32
+  - SFT_LORA_ALPHA: 64
+  - SFT_LORA_DROPOUT: '0.05'
+  - SFT_PER_DEVICE_BATCH: 1
+  - SFT_GRAD_ACCUM: 8
+  - SFT_SAVE_STEPS: 60
+  - SFT_EVAL_STEPS: 60
+  - SFT_DDP_FIND_UNUSED_PARAMETERS: 1
+  - SFT_DATALOADER_NUM_WORKERS: 0
+  - GRPO_LR: 1e-5
+  - GRPO_WARMUP_RATIO: '0.08'
+  - GRPO_LR_SCHEDULER: cosine
+  - GRPO_MAX_GRAD_NORM: '0.3'
+  - GRPO_PER_DEVICE_BATCH: 1
+  - GRPO_GRAD_ACCUM: 8
+  - GRPO_NUM_GENERATIONS: 2
+  - GRPO_NUM_GENERATIONS_EVAL: 2
+  - GRPO_MAX_COMPLETION_LENGTH: 128
+  - GRPO_MASK_TRUNCATED_COMPLETIONS: 0
+  - GRPO_TEMPERATURE: '0.8'
+  - GRPO_TOP_P: '0.95'
+  - GRPO_TOP_K: 0
+  - GRPO_IMPORTANCE_SAMPLING_LEVEL: sequence
+  - GRPO_MULTI_OBJECTIVE_AGGREGATION: normalize_then_sum
+  - GRPO_REWARD_WEIGHTS: 0.0 1.0 0.8 1.2 0.5 1.5
+  - GRPO_SAVE_STEPS: 40
+  - GRPO_EVAL_STEPS: 40
+  - GRPO_DDP_FIND_UNUSED_PARAMETERS: 1
+  - GRPO_DATALOADER_NUM_WORKERS: 2
+  - ATTN_IMPLEMENTATION: auto
+  - VLM_MAX_PIXELS: 1003520
+  - TOKENIZERS_PARALLELISM: 'false'
+  - PYTHONUNBUFFERED: '1'
+  - ENABLE_GPU_PREFLIGHT: '1'
+  - MAX_SFT_SAMPLES: 96
+  - MAX_GRPO_SAMPLES: 48
+  - MAX_DATASET_SAMPLES: 0
+  - HF_DOWNLOAD_MAX_WORKERS: 1
+  - LANG: C.UTF-8
+  - LC_ALL: C.UTF-8
+  - PYTHONUTF8: '1'
+  - PYTHONIOENCODING: utf-8
+  - DISABLE_TRL_MODEL_CARD: '1'
+inputs:
+- experiments/vlm_finetuning/
+- data/
+- examples/
+outputs:
+- data/derived/hf_top_papers_graph_experts/summary.json
+- data/derived/hf_top_papers_graph_experts/README.md
+- data/derived/hf_top_papers_graph_experts/export_summary.json
+- data/derived/hf_top_papers_graph_experts/ARTICLE_IMAGE_SOURCES.md
+- data/derived/hf_top_papers_graph_experts/article_image_sources.jsonl
+- data/derived/hf_top_papers_graph_experts/sft_all.jsonl
+- data/derived/hf_top_papers_graph_experts/sft_train.jsonl
+- data/derived/hf_top_papers_graph_experts/sft_eval.jsonl
+- data/derived/hf_top_papers_graph_experts/grpo_all.jsonl
+- data/derived/hf_top_papers_graph_experts/grpo_train.jsonl
+- data/derived/hf_top_papers_graph_experts/grpo_eval.jsonl
+- outputs/hf_top_papers_qwen3vl_8b_smoke_sft_lora.tar.gz
+- outputs/hf_top_papers_qwen3vl_8b_smoke_grpo_lora.tar.gz
+- reports/hf_top_papers_qwen3vl_8b_smoke_datasphere_reports.tar.gz
+- reports/hf_top_papers_qwen3vl_8b_smoke_datasphere/budget_plan.json
+- reports/hf_top_papers_qwen3vl_8b_smoke_datasphere/gpu_preflight_status.json
+- reports/hf_top_papers_qwen3vl_8b_smoke_datasphere/final_summary.json
+- reports/hf_top_papers_qwen3vl_8b_smoke_datasphere/artifact_manifest.txt
+cloud-instance-types:
+- g2.2
+working-storage:
+  type: SSD
+  size: 1024Gb
+graceful-shutdown:
+  signal: SIGTERM
+  timeout: 3600s

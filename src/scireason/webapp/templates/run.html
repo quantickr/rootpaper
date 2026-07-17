@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Новый запрос{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Новый запрос</h1>
+  <form method="post" action="/run">
+    <label for="query">Тема научного поиска (на русском или английском)</label>
+    <input type="text" id="query" name="query"
+           placeholder="например: прогнозирование трафика с помощью глубокого обучения" required>
+    <p style="margin-top:18px;">
+      <button class="btn" type="submit">Запустить пайплайн</button>
+    </p>
+  </form>
+  <p class="muted">
+    Обработка занимает время (поиск, скачивание PDF, построение графа).
+    Настроить источники и лимиты можно в <a href="/settings">Настройках</a>.
+  </p>
+</div>
+
+{% if jobs %}
+<div class="card">
+  <h2>Последние задачи</h2>
+  <table>
+    <thead><tr><th>Запрос</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td>{{ j.query }}</td>
+        <td><span class="pill">{{ j.status }}</span></td>
+        <td><a href="/run/{{ j.id }}">Открыть</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

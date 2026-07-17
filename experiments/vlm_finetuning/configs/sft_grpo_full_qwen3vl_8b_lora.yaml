@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: sft_grpo_full_qwen3vl_8b_lora
+stage: sft_then_grpo
+model_id: Qwen/Qwen3-VL-8B-Instruct
+training_method: lora
+train_type: peft
+precision: bf16
+attn_implementation: auto
+pipeline:
+  dataset_id: top-papers/top-papers-graph-experts-data
+  dataset_revision: main
+  dataset_source_mode: export
+  dataset_export_subdir: exports/colab-run-001
+  eval_ratio: 0.10
+  build_script: experiments/vlm_finetuning/scripts/build_hf_graph_experts_dataset.py
+  sft_entrypoint: experiments/vlm_finetuning/scripts/train_vlm_sft.py
+  grpo_entrypoint: experiments/vlm_finetuning/scripts/train_vlm_grpo.py
+  output_prefix: hf_top_papers_qwen3vl_8b
+vlm_preprocessing:
+  image_column: images
+  max_images_per_example_sft: 3
+  max_images_per_example_grpo: 2
+  min_pixels: null
+  max_pixels: 1003520
+sft:
+  max_steps: 480
+  num_train_epochs: 4
+  learning_rate: 7.0e-5
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  weight_decay: 0.01
+  max_grad_norm: 0.3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  assistant_only_loss: true
+  max_length: null
+  save_steps: 60
+  eval_steps: 60
+  dataloader_num_workers: 4
+  save_adapter_only: true
+grpo:
+  max_steps: 160
+  num_train_epochs: 1
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.08
+  lr_scheduler_type: cosine
+  max_grad_norm: 0.3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  effective_global_batch_size_on_g2_2: 16
+  num_generations: 2
+  num_generations_eval: 2
+  max_completion_length: 384
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 0
+  mask_truncated_completions: true
+  importance_sampling_level: sequence
+  multi_objective_aggregation: normalize_then_sum
+  reward_weights:
+    label_format: 0.0
+    schema_json: 1.0
+    temporal_fields: 0.8
+    graph_fields: 1.2
+    evidence_grounding: 0.5
+    verdict_exact_match: 1.5
+  sft_adapter_path: outputs/hf_top_papers_qwen3vl_8b_sft_lora
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: all-linear
+resources:
+  datasphere_config: g2.2
+  gpu_count: 2
+  gpu_type: NVIDIA Ampere A100
+  vram_gb: 160
+  ram_gb: 238
+  working_storage_gb: 1024
+budget:
+  budget_rub: 100000
+  price_rub_per_hour_g2_2: 1085.76
+  reserve_rub: 5000
+  shutdown_margin_seconds: 900
+  timeouts_hours:
+    dataset_prepare: 3
+    sft: 48
+    grpo: 35
+    hf_upload: 1
+  configured_compute_hours: 87
+  configured_compute_cost_rub: 94461.12
+  max_safe_compute_hours_after_reserve_and_shutdown_margin: 87.25
+notes:
+  - Build from the prepared HF export sft.jsonl and grpo.jsonl, not the generic imagefolder split.
+  - Keep max_length unset for VLM stages to avoid truncating image tokens.
+  - Use LoRA rank 32 on g2.2 to improve adaptation capacity while keeping VRAM usage safe.
+  - The wrapper has a wall-clock budget guard, but account-level Yandex Cloud budgets/quotas should still be enabled.

@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Образ для Telegram-бота (scireason bot).
+# Тема на русском -> пайплайн (arXiv и др. API -> граф -> русские саммари) -> HTML-отчёт.
+#
+# Бот работает офлайн по умолчанию: mock LLM, hash-эмбеддинги, без Neo4j/Qdrant.
+# Модели перевода argostranslate (en<->ru + xx->en для пивота) и офлайн-детектор
+# языка fastText lid.176 предзагружаются на этапе сборки.
+#
+# Сборка:   docker build -f Dockerfile.bot -t scireason-bot .
+# Запуск:   docker run --rm -e TELEGRAM_BOT_TOKEN=xxx \
+#             -v "$PWD/runs:/app/runs" -v "$PWD/.cache:/app/.cache" scireason-bot
+# Или через docker compose (сервис bot) — см. docker-compose.yml.
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # Куда argostranslate кладёт скачанные модели (переносим в /app, чтобы
+    # можно было при желании смонтировать томом и не качать заново).
+    ARGOS_PACKAGES_DIR=/app/.cache/argos-translate \
+    XDG_DATA_HOME=/app/.cache/xdg \
+    # Offline-безопасные значения по умолчанию (можно переопределить через -e/.env).
+    LLM_PROVIDER=mock \
+    EMBED_PROVIDER=hash \
+    GRAPH_BACKEND=none \
+    VLM_BACKEND=none \
+    OCR_BACKEND=pymupdf
+
+WORKDIR /app
+
+# Системные зависимости: build-essential для сборки колёс (sentencepiece и т.п.),
+# libgl1/libglib2.0-0 нужны PyMuPDF/pillow при работе с изображениями.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Сначала только метаданные пакета + исходники, чтобы кэшировать слой установки.
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY scripts ./scripts
+COPY data ./data
+
+# Устанавливаем сам пакет и рантайм-зависимости бота:
+#  - aiogram: Telegram Bot API (не входит в pyproject.toml);
+#  - argostranslate: офлайн-перевод en<->ru и пивот xx->en->ru;
+#  - pymupdf: извлечение текста из PDF (OCR_BACKEND=pymupdf);
+#  - langdetect: детекция языка исходной статьи (фолбэк);
+#  - fasttext-wheel: детектор lid.176 (точнее langdetect; C-предикт обходит
+#    несовместимость с NumPy 2.x в Python-обёртке).
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install -e . && \
+    python -m pip install "aiogram>=3,<4" argostranslate pymupdf \
+        langdetect fasttext-wheel \
+        "psycopg[binary]>=3.1" "psycopg_pool>=3.2"
+
+# Предзагружаем модели перевода: en<->ru и все xx->en (пивот для не-английских
+# статей). Требует сети во время сборки; при офлайн-сборке скрипт не падает,
+# но перевод деградирует до no-op.
+RUN python scripts/preload_argos.py
+
+# Предзагружаем офлайн-модель определения языка fastText lid.176 (~1 МБ, 176
+# языков) в /app/.cache/fasttext/lid.176.ftz. Скрипт идемпотентен и не валит
+# сборку при отсутствии сети (детекция откатится на langdetect / эвристику).
+RUN python scripts/preload_fasttext_lid.py
+
+# Тома для персистентности (создаются, чтобы права были корректны):
+#  - /app/runs   : результаты пайплайна + SQLite бота (runs/tg_bot.sqlite3);
+#  - /app/.cache : HTTP-кэш и модели перевода.
+RUN mkdir -p /app/runs /app/.cache
+
+# Бот не слушает порты (long-polling к Telegram).
+ENTRYPOINT ["top-papers-graph"]
+CMD ["bot"]

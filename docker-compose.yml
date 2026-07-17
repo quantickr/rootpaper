@@ -1,0 +1,206 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: top-papers-graph-app
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-please_change_me}
+      MEMGRAPH_URI: bolt://memgraph:7687
+      GROBID_URL: http://grobid:8070
+      GRAPH_BACKEND: ${GRAPH_BACKEND:-neo4j}
+    volumes:
+      - ./:/app
+    depends_on:
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_started
+      grobid:
+        condition: service_started
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: top-papers-graph-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-please_change_me}
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u $${NEO4J_USER:-neo4j} -p $${NEO4J_PASSWORD:-please_change_me} 'RETURN 1;' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    container_name: top-papers-graph-qdrant
+    healthcheck:
+      test: >
+        sh -c '
+          (which curl || (export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get -y install curl)) &&
+          curl -f http://localhost:6333/healthz
+        '
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: top-papers-graph-memgraph
+    profiles: ["full", "bot"]
+    healthcheck:
+      test: ["CMD", "sh", "-c", 'echo "RETURN \"DB OK\";" | mgconsole']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "7688:7687"
+      - "7444:7444"
+    command: ["--log-level=TRACE"]
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+
+  lab:
+    image: memgraph/lab:latest
+    container_name: top-papers-graph-memgraph-lab
+    profiles: ["full", "bot"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "3000:3000"
+    depends_on:
+      - memgraph
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+      QUICK_CONNECT_MG_PORT: 7687
+
+  grobid:
+    image: lfoppiano/grobid:0.8.2.1-crf
+    container_name: top-papers-graph-grobid
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "8070:8070"
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: top-papers-graph-bot
+    profiles: ["bot"]
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      # Offline-режим по умолчанию: бот не зависит от Neo4j/Qdrant/GROBID.
+      # Переопредели через .env, если хочешь подключить графовые БД.
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-hash}
+      GRAPH_BACKEND: ${GRAPH_BACKEND:-none}
+      VLM_BACKEND: ${VLM_BACKEND:-none}
+      OCR_BACKEND: ${OCR_BACKEND:-pymupdf}
+      # Общая БД с сайтом: Postgres. История отчётов из бота и сайта — единая.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-mydatabase}}
+      # TELEGRAM_BOT_TOKEN берётся из .env (env_file выше).
+    volumes:
+      # Персистентность: результаты пайплайна и кэши (БД — в Postgres).
+      - bot_runs:/app/runs
+      - bot_cache:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["bot"]
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: top-papers-graph-web
+    profiles: ["bot", "web"]
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      # Offline-режим по умолчанию (как у бота).
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-hash}
+      GRAPH_BACKEND: ${GRAPH_BACKEND:-none}
+      VLM_BACKEND: ${VLM_BACKEND:-none}
+      OCR_BACKEND: ${OCR_BACKEND:-pymupdf}
+      # Общая БД с ботом: Postgres из сервиса ниже.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-mydatabase}}
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 8080
+      # Обязательно переопредели в .env на проде!
+      WEB_SECRET_KEY: ${WEB_SECRET_KEY:-change-me-in-production}
+      WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:8080}
+      # TELEGRAM_BOT_USERNAME/TOKEN и SMTP_* берутся из .env (env_file выше).
+    ports:
+      - "8080:8080"
+    volumes:
+      - bot_runs:/app/runs
+      - bot_cache:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["web"]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: top-papers-graph-postgres
+    profiles: ["bot", "web"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-mydatabase}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-user} -d $${POSTGRES_DB:-mydatabase}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  qdrant_storage:
+  neo4j_data:
+  memgraph_data:
+  pg_data:
+  bot_runs:
+  bot_cache:

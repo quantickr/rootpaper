@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Статус задачи{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Обработка запроса</h1>
+  <p><b>Запрос:</b> {{ job.query }}</p>
+  <p><b>Статус:</b> <span id="status" class="pill">{{ job.status }}</span></p>
+  <p id="message" class="muted">{{ job.message }}</p>
+  <div id="result"></div>
+</div>
+
+<script>
+const jobId = "{{ job.id }}";
+const statusEl = document.getElementById("status");
+const msgEl = document.getElementById("message");
+const resultEl = document.getElementById("result");
+
+async function poll() {
+  try {
+    const r = await fetch(`/run/${jobId}/state`);
+    if (!r.ok) return;
+    const j = await r.json();
+    statusEl.textContent = j.status;
+    msgEl.textContent = j.message || "";
+    if (j.status === "done" && j.report_id) {
+      resultEl.innerHTML =
+        `<p><a class="btn" href="/reports/${j.report_id}/view" target="_blank">Открыть отчёт</a> ` +
+        `&nbsp;<a class="btn-ghost" href="/reports/${j.report_id}/download">Скачать</a></p>`;
+      return;
+    }
+    if (j.status === "error") return;
+    setTimeout(poll, 3000);
+  } catch (e) {
+    setTimeout(poll, 5000);
+  }
+}
+{% if job.status in ("queued", "running") %}poll();{% endif %}
+{% if job.status == "done" and job.report_id %}
+resultEl.innerHTML =
+  `<p><a class="btn" href="/reports/{{ job.report_id }}/view" target="_blank">Открыть отчёт</a> ` +
+  `&nbsp;<a class="btn-ghost" href="/reports/{{ job.report_id }}/download">Скачать</a></p>`;
+{% endif %}
+</script>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Настройки{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Настройки</h1>
+  <form method="post" action="/settings">
+    <label>Источники поиска</label>
+    <div class="sources">
+      {% for s in sources %}
+      <label>
+        <input type="checkbox" name="source" value="{{ s.key }}" {% if s.on %}checked{% endif %}>
+        {{ s.title }}
+      </label>
+      {% endfor %}
+    </div>
+
+    <label for="search_limit">search-limit (сколько статей искать)</label>
+    <input type="number" id="search_limit" name="search_limit" min="1" value="{{ search_limit }}">
+
+    <label for="top_papers">top-papers (сколько взять в отчёт)</label>
+    <input type="number" id="top_papers" name="top_papers" min="1" value="{{ top_papers }}">
+
+    <p style="margin-top:18px;">
+      <button class="btn" type="submit">Сохранить</button>
+    </p>
+  </form>
+  <p class="muted">Настройки применяются к запросам с сайта и в Telegram-боте.</p>
+</div>
+{% endblock %}

@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+topic: demo validation topic
+submission_id: sample_validation_demo
+pipeline: full
+papers:
+  - id: doi:10.1234/demo.paper
+    title: Demo Paper for Validation
+    year: 2024
+steps:
+  - id: step_1
+    inference: Demo inference over a placeholder paper.
+    next_question: What temporal relation should be validated next?
+    sources:
+      - source: doi:10.1234/demo.paper
+        title: Demo Paper for Validation

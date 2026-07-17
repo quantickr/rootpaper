@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Дашборд{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Моя статистика</h1>
+  <div class="grid">
+    <div class="stat"><div class="num">{{ stats.reports }}</div><div class="lbl">Отчётов</div></div>
+    <div class="stat"><div class="num">{{ total_mb }}</div><div class="lbl">МБ данных</div></div>
+  </div>
+</div>
+
+{% if stats.top_queries %}
+<div class="card">
+  <h2>Частые запросы</h2>
+  <table>
+    <thead><tr><th>Запрос</th><th>Раз</th></tr></thead>
+    <tbody>
+      {% for q, n in stats.top_queries %}
+      <tr><td>{{ q }}</td><td class="muted">{{ n }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

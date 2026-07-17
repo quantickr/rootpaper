@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Мои отчёты{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Мои отчёты <span class="muted">({{ total }})</span></h1>
+  {% if items %}
+  <table>
+    <thead>
+      <tr><th>Дата</th><th>Запрос</th><th>Источник</th><th>Размер</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td class="muted">{{ it.when }}</td>
+        <td>{{ it.query }}</td>
+        <td><span class="pill">{{ it.origin }}</span></td>
+        <td class="muted">{{ it.size_kb }} КБ</td>
+        <td>
+          <a href="/reports/{{ it.id }}/view" target="_blank">Открыть</a>
+          &nbsp;·&nbsp;
+          <a href="/reports/{{ it.id }}/download">Скачать</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if pages > 1 %}
+  <div class="pager">
+    {% if page > 1 %}<a class="btn-ghost" href="/reports?page={{ page-1 }}">← Назад</a>{% endif %}
+    <span class="muted">Стр. {{ page }} из {{ pages }}</span>
+    {% if page < pages %}<a class="btn-ghost" href="/reports?page={{ page+1 }}">Вперёд →</a>{% endif %}
+  </div>
+  {% endif %}
+  {% else %}
+  <p class="muted">Пока нет отчётов. <a href="/run">Запустите первый запрос</a>.</p>
+  {% endif %}
+</div>
+{% endblock %}

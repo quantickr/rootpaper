@@ -1,0 +1,379 @@
+# SPDX-FileCopyrightText: 2026 top-papers-graph contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "top-papers-graph"
+version = "0.4.3"
+description = "Open-source course and toolkit for scientific literature analysis, temporal knowledge graphs and hypothesis generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name="top-papers-graph contributors"}]
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+dependencies = [
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "typer>=0.12",
+  "rich>=13.7",
+  "httpx>=0.27",
+  "tenacity>=8.2",
+  "python-dotenv>=1.0",
+  "pyyaml>=6.0",
+  "networkx>=3.3",
+  "numpy>=1.26,<3",
+  "pypdf>=4.0",
+  "huggingface_hub>=0.30",
+
+  # Optional infra clients (services are optional; pipeline falls back to local artifacts)
+  "neo4j>=5.20",
+  "qdrant-client>=1.9",
+
+  # Optional LLM routing
+  "litellm>=1.0",
+
+  # Lightweight agent workflow helpers already used in the repo
+  "langchain-core>=0.2",
+  "langgraph>=0.1",
+]
+
+[project.optional-dependencies]
+# Higher-quality local embeddings
+embeddings = [
+  "sentence-transformers>=2.7",
+]
+
+# Multimodal ingestion + embeddings (optional)
+mm = [
+  "pymupdf>=1.24",
+  "paddleocr[doc-parser]>=3.0.0",
+  "paddlepaddle>=3.0.0; platform_system != 'Darwin'",
+  "pillow>=10.0",
+  "open_clip_torch>=2.24",
+  "torch>=2.2",
+  "transformers>=4.57.0",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "qwen-vl-utils>=0.0.14",
+  "g4f>=7.1.2",
+  "langchain-community>=0.3",
+  "langchain-text-splitters>=0.3",
+]
+
+
+# Human-friendly alias for multimodal stack
+multimodal = [
+  "pymupdf>=1.24",
+  "paddleocr[doc-parser]>=3.0.0",
+  "paddlepaddle>=3.0.0; platform_system != 'Darwin'",
+  "pillow>=10.0",
+  "open_clip_torch>=2.24",
+  "torch>=2.2",
+  "transformers>=4.57.0",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "qwen-vl-utils>=0.0.14",
+  "g4f>=7.1.2",
+  "langchain-community>=0.3",
+  "langchain-text-splitters>=0.3",
+]
+
+# Notebook / Colab visualization helpers
+notebook_viz = [
+  "ipywidgets>=8.1",
+  "panel>=1.4",
+  "hvplot>=0.10",
+  "holoviews>=1.19",
+  "bokeh>=3.4",
+  "pyvis>=0.3.2",
+  "jupyter_bokeh>=4.0",
+  "pandas>=2.2.2,<2.4",
+]
+
+# Friendly aliases for the same notebook stack
+notebook = [
+  "ipywidgets>=8.1",
+  "panel>=1.4",
+  "hvplot>=0.10",
+  "holoviews>=1.19",
+  "bokeh>=3.4",
+  "pyvis>=0.3.2",
+  "jupyter_bokeh>=4.0",
+  "pandas>=2.2.2,<2.4",
+  "gdown>=5.2.0",
+  "openpyxl>=3.1.5",
+  "py7zr>=0.22.0",
+  "Unidecode>=1.3.8",
+]
+
+colab = [
+  "ipywidgets>=8.1",
+  "panel>=1.4",
+  "hvplot>=0.10",
+  "holoviews>=1.19",
+  "bokeh>=3.4",
+  "pyvis>=0.3.2",
+  "jupyter_bokeh>=4.0",
+  "pandas>=2.2.2,<2.4",
+  "gdown>=5.2.0",
+  "openpyxl>=3.1.5",
+  "py7zr>=0.22.0",
+  "Unidecode>=1.3.8",
+]
+
+# One-shot extra for the Task 2 notebook experience.
+# Keep this extra intentionally lightweight so editable installs remain robust in
+# Colab/Jupyter. Heavy multimodal/runtime providers (PaddleOCR, Transformers VLM,
+# open_clip, g4f) are installed by the notebook on a best-effort basis.
+task2_notebook = [
+  "python-dateutil>=2.9",
+  "dateparser>=1.2",
+  "pymupdf>=1.24",
+  "pillow>=10.0",
+  "ipywidgets>=8.1",
+  "panel>=1.4",
+  "hvplot>=0.10",
+  "holoviews>=1.19",
+  "bokeh>=3.4",
+  "pyvis>=0.3.2",
+  "jupyter_bokeh>=4.0",
+  "pandas>=2.2.2,<2.4",
+  "gdown>=5.2.0",
+  "openpyxl>=3.1.5",
+  "py7zr>=0.22.0",
+  "Unidecode>=1.3.8",
+]
+
+# Temporal parsing helpers
+
+temporal = [
+  "python-dateutil>=2.9",
+  "dateparser>=1.2",
+]
+
+# FastAPI service (optional)
+api = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+]
+
+# Веб-сайт: регистрация (email/пароль или Telegram), отчёты, дашборд.
+# По умолчанию общая БД с ботом (SQLite). Для Postgres нужен psycopg — включён здесь.
+web = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "jinja2>=3.1",
+  "python-multipart>=0.0.9",
+  "itsdangerous>=2.1",
+  "bcrypt>=4.0",
+  "psycopg[binary]>=3.1",
+  "psycopg_pool>=3.2",
+]
+
+mcp = [
+  "mcp>=1.0.0",
+]
+
+# Extra connectors / compatibility
+# Dedicated extra kept for users who want to install g4f explicitly.
+g4f = [
+  "g4f>=7.1.2",
+]
+
+# Optional dependency if you want to compare with Hugging Face smolagents.
+agents = [
+  "smolagents>=1.0.0",
+]
+
+# smolagents + local HF models via TransformersModel
+agents_hf = [
+  "smolagents[transformers]>=1.0.0",
+]
+
+# Optional "adult" GNN mode via PyTorch Geometric.
+# NOTE: PyG itself can be installed via PyPI.
+# For best performance, also install extension wheels (pyg-lib/torch-scatter/...) as described
+# in PyG's installation notes (see docs/gnn.md).
+gnn = [
+  "torch>=2.2",
+  "torch-geometric>=2.6.0",
+]
+
+gnn_ext = [
+  "pyg-lib>=0.4.0",
+  "torch-scatter>=2.1.2",
+  "torch-sparse>=0.6.18",
+  "torch-cluster>=1.6.3",
+  "torch-spline-conv>=1.2.2",
+]
+
+# Temporal link prediction / TGNN track (PyTorch + optional PyG TGN memory backend).
+tgnn = [
+  "torch>=2.2",
+  "torch-geometric>=2.6.0",
+]
+
+
+# Task 3: multimodal temporal hypothesis generation.
+# Keeps Annoy + PyTorch Geometric Temporal optional and isolated.
+task3 = [
+  "pymupdf>=1.24",
+  "pillow>=10.0",
+  "torch>=2.2",
+  "transformers>=4.57.0",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "qwen-vl-utils>=0.0.14",
+  "g4f>=7.1.2",
+  "langchain-community>=0.3",
+  "langchain-text-splitters>=0.3",
+  "python-dateutil>=2.9",
+  "dateparser>=1.2",
+  "annoy>=1.17.3; python_version < \"3.13\"",
+  "torch-geometric>=2.6.0",
+  "torch-geometric-temporal>=0.56.2",
+]
+
+# Task 3 Google-Sheets -> Hugging Face benchmark export.
+task3_hf_benchmark = [
+  "gdown>=5.2.0",
+  "huggingface_hub>=0.30",
+  "datasets>=3.0",
+  "pandas>=2.2.2,<2.4",
+  "openpyxl>=3.1.5",
+  "PyYAML>=6.0",
+  "Unidecode>=1.3.8",
+  "requests>=2.32",
+  "pymupdf>=1.24",
+]
+
+# OCR / layout extraction (PaddleOCR full-stack).
+ocr = [
+  "paddleocr[doc-parser]>=3.0.0",
+  "paddlepaddle>=3.0.0; platform_system != 'Darwin'",
+  "langchain-community>=0.3",
+  "langchain-text-splitters>=0.3",
+]
+
+# Convenience extra for the full document -> graph -> retrieval -> VLM stack.
+fullstack = [
+  "sentence-transformers>=2.7",
+  "pymupdf>=1.24",
+  "pillow>=10.0",
+  "open_clip_torch>=2.24",
+  "torch>=2.2",
+  "transformers>=4.57.0",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "qwen-vl-utils>=0.0.14",
+  "python-dateutil>=2.9",
+  "dateparser>=1.2",
+  "torch-geometric>=2.6.0",
+  "paddleocr[doc-parser]>=3.0.0",
+  "paddlepaddle>=3.0.0; platform_system != 'Darwin'",
+  "g4f>=7.1.2",
+  "langchain-community>=0.3",
+  "langchain-text-splitters>=0.3",
+]
+
+# Neo4j as graph + vector DB, GraphRAG integration.
+neo4j_rag = [
+  "neo4j-graphrag>=1.8.0",
+]
+
+# Optional RDF/SHACL validation track for temporal KG contracts.
+rdf_validation = [
+  "rdflib>=7.0",
+  "pyshacl>=0.30.0",
+]
+
+battery = [
+  "pybamm>=25.12.0",
+  "pandas>=2.2.2,<2.4",
+  "matplotlib>=3.8",
+]
+
+
+# Broad convenience extra for local development.
+# Excludes gnn_ext because those wheels are often installed separately per PyG docs.
+all = [
+  "sentence-transformers>=2.7",
+  "pymupdf>=1.24",
+  "pillow>=10.0",
+  "open_clip_torch>=2.24",
+  "torch>=2.2",
+  "transformers>=4.57.0",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "qwen-vl-utils>=0.0.14",
+  "python-dateutil>=2.9",
+  "dateparser>=1.2",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "jinja2>=3.1",
+  "python-multipart>=0.0.9",
+  "itsdangerous>=2.1",
+  "bcrypt>=4.0",
+  "psycopg[binary]>=3.1",
+  "psycopg_pool>=3.2",
+  "mcp>=1.0.0",
+  "g4f>=7.1.2",
+  "smolagents>=1.0.0",
+  "smolagents[transformers]>=1.0.0",
+  "torch-geometric>=2.6.0",
+  "neo4j-graphrag>=1.8.0",
+  "rdflib>=7.0",
+  "pyshacl>=0.30.0",
+  "pybamm>=25.12.0",
+  "matplotlib>=3.8",
+  "ipywidgets>=8.1",
+  "panel>=1.4",
+  "hvplot>=0.10",
+  "holoviews>=1.19",
+  "bokeh>=3.4",
+  "pyvis>=0.3.2",
+  "jupyter_bokeh>=4.0",
+  "pandas>=2.2.2,<2.4",
+]
+
+dev = [
+  "pytest>=8.0",
+  "pytest-xdist>=3.5",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-requests",
+  "pre-commit>=3.7",
+  "streamlit>=1.36",
+  "ragas>=0.1.15",
+  "deepeval>=3.0",
+]
+
+[project.scripts]
+top-papers-graph = "scireason.cli:app"
+scireason = "scireason.cli:app"
+top-papers-graph-api = "scireason.api.main:main"
+top-papers-graph-web = "scireason.webapp.main:main"
+top-papers-graph-mcp = "scireason.mcp.server:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: end-to-end / smoke integration tests (may be skipped when optional deps are missing)",
+]
