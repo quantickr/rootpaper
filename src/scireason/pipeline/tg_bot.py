@@ -77,6 +77,10 @@ class _Job:
     # Флаг отмены: worker пропустит задачу, ещё не начавшую (или уже
     # выполняющуюся) обработку — результат просто не будет отправлен.
     cancelled: bool = False
+    # kind="search" — обычный поиск; kind="compare" — сравнение статей.
+    kind: str = "search"
+    # Для сравнения: сырой ввод пользователя (ссылки/DOI/arXiv-ID по строкам).
+    inputs: str = ""
 
 
 def _find_report(run_dir: Path) -> Optional[Path]:
@@ -105,6 +109,14 @@ def _run_pipeline_blocking(
         generate_report=True,
         progress_fn=progress_fn,
     )
+
+
+def _run_compare_blocking(inputs: str, *, progress_fn=None) -> bytes:
+    """Blocking сравнение статей (выполняется в thread-executor). Возвращает HTML."""
+
+    from .compare import run_compare
+
+    return run_compare(inputs, progress_fn=progress_fn)
 
 
 def build_bot_app(
@@ -141,6 +153,10 @@ def build_bot_app(
     # Пользователи, от которых бот сейчас ждёт число вместо поискового запроса.
     # user_id -> "search_limit" | "top_papers".
     awaiting_number: Dict[int, str] = {}
+
+    # Пользователи, от которых бот сейчас ждёт список ссылок/DOI/arXiv-ID
+    # для сравнения статей (режим /compare).
+    awaiting_compare: set[int] = set()
 
     # Активные задачи по job_id (для кнопки «Отмена»). Задача удаляется отсюда,
     # когда обработка окончательно завершилась (успех/ошибка/отмена).
@@ -200,6 +216,7 @@ def build_bot_app(
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔎 Новый поиск", callback_data="menu:search")],
+                [InlineKeyboardButton(text="🔗 Сравнить статьи", callback_data="menu:compare")],
                 [
                     InlineKeyboardButton(text="🗂 Мои отчёты", callback_data="menu:story"),
                     InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
@@ -254,6 +271,8 @@ def build_bot_app(
         "я пришлю отчёт файлом, как только он будет готов.\n\n"
         "Кнопки меню (или команды):\n"
         "• 🔎 Новый поиск — просто пришли тему сообщением.\n"
+        "• 🔗 Сравнить статьи (/compare) — пришли 2+ ссылки/DOI/arXiv-ID "
+        "(по одной на строку); получишь сходства, различия, таблицу и граф связей.\n"
         "• ⚙️ Настройки (/settings) — источники и лимиты search-limit / top-papers.\n"
         "• 🗂 Мои отчёты (/story) — прошлые отчёты; жми на запись, чтобы скачать HTML.\n\n"
         "Есть и веб-версия: заведи аккаунт по почте и привяжи этот Telegram — "
@@ -305,6 +324,49 @@ def build_bot_app(
             status_message_id=status.message_id,
             query=text,
             job_id=job_id,
+        )
+        jobs_by_id[job_id] = job
+        await queue.put(job)
+
+    _COMPARE_PROMPT = (
+        "Пришли <b>2 или более</b> статьи — по одной на строку. "
+        "Подойдут ссылки arXiv, DOI, ссылки doi.org или обычные URL.\n\n"
+        "Например:\n"
+        "<code>https://arxiv.org/abs/1706.03762\n"
+        "10.1038/s41586-020-2649-2\n"
+        "https://arxiv.org/abs/2005.14165</code>"
+    )
+
+    async def _enqueue_compare(message: "Message", inputs: str) -> None:
+        """Поставить сравнение статей в очередь обработки."""
+
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        if message.from_user is not None:
+            try:
+                db.ensure_tg_user(user_id, message.from_user.username)
+            except Exception:  # pragma: no cover - best-effort
+                pass
+        n_lines = len([x for x in inputs.splitlines() if x.strip()])
+        query = f"Сравнение статей ({n_lines})" if n_lines else "Сравнение статей"
+        job_id = _next_job_id()
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel:{job_id}")]
+            ]
+        )
+        status = await message.answer(
+            "Принял на сравнение. Загружаю статьи и сравниваю — "
+            "это может занять пару минут…",
+            reply_markup=cancel_kb,
+        )
+        job = _Job(
+            chat_id=message.chat.id,
+            user_id=user_id,
+            status_message_id=status.message_id,
+            query=query,
+            job_id=job_id,
+            kind="compare",
+            inputs=inputs,
         )
         jobs_by_id[job_id] = job
         await queue.put(job)
@@ -362,6 +424,19 @@ def build_bot_app(
             parse_mode="HTML",
         )
 
+    @dp.message(Command("compare"))
+    async def _compare_cmd(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        # Ссылки могут идти прямо в команде — по строкам после /compare.
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 2 and len([x for x in parts[1].splitlines() if x.strip()]) >= 2:
+            awaiting_compare.discard(user_id)
+            await _enqueue_compare(message, parts[1].strip())
+            return
+        awaiting_number.pop(user_id, None)
+        awaiting_compare.add(user_id)
+        await message.answer(_COMPARE_PROMPT, parse_mode="HTML")
+
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
         await message.answer(_HELP_TEXT, reply_markup=_main_menu_kb())
@@ -383,11 +458,16 @@ def build_bot_app(
         action = cb.data.split(":", 1)[1]
         if action == "search":
             awaiting_number.pop(user_id, None)
+            awaiting_compare.discard(user_id)
             await cb.message.answer(
                 "Пришли тему научного поиска одним сообщением — например, "
                 "<b>графовые нейросети для рекомендаций</b>.",
                 parse_mode="HTML",
             )
+        elif action == "compare":
+            awaiting_number.pop(user_id, None)
+            awaiting_compare.add(user_id)
+            await cb.message.answer(_COMPARE_PROMPT, parse_mode="HTML")
         elif action == "story":
             await _send_story(cb.message, user_id)
         elif action == "settings":
@@ -499,6 +579,19 @@ def build_bot_app(
             )
             return
 
+        # Если ждём ссылки для сравнения — интерпретируем сообщение как список.
+        if user_id in awaiting_compare:
+            n_lines = len([x for x in text.splitlines() if x.strip()])
+            if n_lines < 2:
+                await message.answer(
+                    "Нужно минимум 2 статьи — по одной ссылке/DOI/arXiv-ID на строку. "
+                    "Пришли список ещё раз."
+                )
+                return
+            awaiting_compare.discard(user_id)
+            await _enqueue_compare(message, text)
+            return
+
         if not text:
             await message.answer("Пустой запрос. Пришли тему текстом.")
             return
@@ -511,6 +604,106 @@ def build_bot_app(
         frac = max(0.0, min(1.0, float(fraction)))
         filled = int(round(frac * 10))
         return "▰" * filled + "▱" * (10 - filled) + f" {int(round(frac * 100))}%"
+
+    async def _process_compare_job(job: _Job, run_job_id: str, on_progress) -> None:
+        """Сравнение статей: HTML в памяти → история + share-ссылка + документ."""
+
+        from aiogram.types import BufferedInputFile
+        from .compare import CompareError
+
+        loop = asyncio.get_running_loop()
+        try:
+            html_bytes = await loop.run_in_executor(
+                None,
+                lambda: _run_compare_blocking(job.inputs, progress_fn=on_progress),
+            )
+        except CompareError as e:
+            try:
+                db.update_run_job(run_job_id, status="error", stage=str(e))
+            except Exception:  # pragma: no cover - best-effort
+                pass
+            await bot.send_message(job.chat_id, f"Не удалось сравнить статьи: {e}")
+            return
+        except Exception as e:  # pragma: no cover - runtime failure path
+            logger.exception("Compare failed for inputs of user=%s", job.user_id)
+            try:
+                db.update_run_job(run_job_id, status="error", stage="Ошибка")
+            except Exception:
+                pass
+            await bot.send_message(
+                job.chat_id,
+                f"Не удалось сравнить статьи: {type(e).__name__}: {e}",
+            )
+            return
+
+        # Пользователь мог нажать «Отмена», пока шло сравнение.
+        if job.cancelled:
+            try:
+                db.update_run_job(run_job_id, status="error", stage="Отменено")
+            except Exception:
+                pass
+            return
+
+        # Сохраняем в историю + готовим публичную ссылку.
+        share_url: Optional[str] = None
+        saved_report_id: Optional[int] = None
+        try:
+            report_id = db.add_report(
+                job.user_id, job.query, html_bytes, origin="compare"
+            )
+            saved_report_id = report_id
+            try:
+                token = db.create_report_share(report_id)
+                base = (settings.web_base_url or "").rstrip("/")
+                if base:
+                    share_url = f"{base}/r/{token}"
+            except Exception:  # pragma: no cover - ссылка best-effort
+                logger.exception("Failed to create share link for compare")
+        except Exception:  # pragma: no cover - history is best-effort
+            logger.exception("Failed to store compare report for user=%s", job.user_id)
+
+        try:
+            db.update_run_job(
+                run_job_id,
+                status="done",
+                stage="Готово",
+                progress=1.0,
+                report_id=saved_report_id,
+            )
+        except Exception:  # pragma: no cover
+            pass
+
+        if len(html_bytes) > _MAX_TG_DOCUMENT_BYTES:
+            too_big = "Сравнение готово, но файл слишком большой для Telegram."
+            if share_url:
+                too_big += f"\n\n🔗 Открой его на сайте: {share_url}"
+            await bot.send_message(job.chat_id, too_big)
+            return
+
+        open_kb = None
+        if share_url:
+            open_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔗 Открыть на сайте", url=share_url)]
+                ]
+            )
+        link_line = f"\n\n🔗 Открыть на сайте: {share_url}" if share_url else ""
+        try:
+            await bot.send_document(
+                job.chat_id,
+                BufferedInputFile(html_bytes, filename="compare.html"),
+                caption=(
+                    "Готово: сравнение статей. Открой файл в браузере — внутри "
+                    f"сходства, различия, таблица и граф связей.{link_line}"
+                ),
+                reply_markup=open_kb,
+            )
+        except Exception as e:  # pragma: no cover - runtime failure path
+            logger.exception("Failed to send compare report for user=%s", job.user_id)
+            await bot.send_message(
+                job.chat_id,
+                f"Сравнение готово, но не удалось отправить файл: {type(e).__name__}: {e}",
+            )
 
     async def _process_job(job: _Job) -> None:
         from aiogram.types import FSInputFile
@@ -526,8 +719,9 @@ def build_bot_app(
 
         # Общий id запуска для таблицы run_jobs (прогресс виден и на сайте).
         run_job_id = f"bot-{job.job_id}"
+        origin = "compare" if job.kind == "compare" else "web"
         try:
-            db.create_run_job(run_job_id, job.user_id, job.query)
+            db.create_run_job(run_job_id, job.user_id, job.query, origin=origin)
         except Exception:  # pragma: no cover - best-effort
             logger.debug("create_run_job failed for %s", run_job_id, exc_info=True)
 
@@ -578,6 +772,11 @@ def build_bot_app(
                     pass
 
             fut.add_done_callback(_swallow)
+
+        # --- Ветка сравнения статей: результат — HTML в памяти (bytes) ---
+        if job.kind == "compare":
+            await _process_compare_job(job, run_job_id, _on_progress)
+            return
 
         try:
             run_dir = await loop.run_in_executor(
@@ -718,6 +917,7 @@ def build_bot_app(
             await bot.set_my_commands(
                 [
                     BotCommand(command="search", description="🔎 Новый научный поиск"),
+                    BotCommand(command="compare", description="🔗 Сравнить статьи"),
                     BotCommand(command="story", description="🗂 Мои отчёты"),
                     BotCommand(command="settings", description="⚙️ Настройки"),
                     BotCommand(command="menu", description="📋 Главное меню"),

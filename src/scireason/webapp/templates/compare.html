@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Сравнить статьи{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Сравнить статьи</h1>
+  <p class="muted">
+    Вставь <b>2 или более</b> статьи — по одной на строку. Подойдут ссылки arXiv,
+    DOI, ссылки doi.org или обычные URL. Программа найдёт сходства, различия и связи,
+    построит таблицу сравнения, граф связей и выделит общие темы.
+  </p>
+  <form method="post" action="/compare">
+    <label for="inputs">Ссылки / DOI / arXiv-ID (по одной на строку)</label>
+    <textarea id="inputs" name="inputs" rows="7"
+      placeholder="https://arxiv.org/abs/1706.03762&#10;10.1038/s41586-020-2649-2&#10;https://arxiv.org/abs/2005.14165" required>{{ inputs or '' }}</textarea>
+    <p style="margin-top:18px;">
+      <button class="btn btn-block" type="submit">Сравнить статьи</button>
+    </p>
+  </form>
+</div>
+
+{% if jobs %}
+<div class="card">
+  <h2>Последние сравнения</h2>
+  <table>
+    <thead><tr><th>Запрос</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td>{{ j.query }}</td>
+        <td><span class="pill">{{ j.status }}</span></td>
+        <td><a href="/run/{{ j.id }}">Открыть</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

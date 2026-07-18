@@ -34,6 +34,10 @@ class Job:
     progress: float = 0.0  # 0.0–1.0, обновляется колбэком пайплайна
     stage: str = ""  # человекочитаемая метка текущего этапа
     created_at: float = field(default_factory=time.time)
+    # kind="search" — обычный пайплайн; kind="compare" — сравнение статей.
+    kind: str = "search"
+    # Для сравнения: сырой ввод пользователя (ссылки/DOI/arXiv-ID по строкам).
+    inputs: str = ""
 
 
 class JobManager:
@@ -49,6 +53,23 @@ class JobManager:
         with self._lock:
             self._jobs[job.id] = job
         self._executor.submit(self._run, job.id)
+        return job
+
+    def submit_compare(self, owner_id: int, inputs: str) -> Job:
+        """Поставить задачу сравнения статей (ссылки/DOI/arXiv-ID по строкам)."""
+
+        n_lines = len([x for x in (inputs or "").splitlines() if x.strip()])
+        query = f"Сравнение статей ({n_lines})" if n_lines else "Сравнение статей"
+        job = Job(
+            id=uuid.uuid4().hex[:12],
+            owner_id=owner_id,
+            query=query,
+            kind="compare",
+            inputs=inputs,
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+        self._executor.submit(self._run_compare, job.id)
         return job
 
     def get(self, job_id: str) -> Optional[Job]:
@@ -138,6 +159,56 @@ class JobManager:
             )
         except Exception as e:  # pragma: no cover
             logger.exception("Failed to store web report for %r", job.query)
+            job.status = "error"
+            job.message = f"Не удалось сохранить отчёт: {e}"
+            self._mirror(job.id, status="error", stage="Ошибка сохранения")
+
+    # -------------------------------------------------------- compare worker
+    def _run_compare(self, job_id: str) -> None:
+        from ..pipeline.compare import CompareError, run_compare
+        from ..store import get_store
+
+        job = self.get(job_id)
+        if job is None:
+            return
+        job.status = "running"
+        job.progress = 0.02
+        job.stage = "Запускаю сравнение…"
+        db = get_store()
+        try:
+            db.create_run_job(job.id, job.owner_id, job.query, origin="compare")
+        except Exception:  # pragma: no cover
+            logger.debug("create_run_job failed for %s", job.id, exc_info=True)
+
+        try:
+            html = run_compare(
+                job.inputs,
+                progress_fn=lambda label, frac: self._set_progress(job, label, frac),
+            )
+        except CompareError as e:
+            job.status = "error"
+            job.message = str(e)
+            self._mirror(job.id, status="error", stage=str(e))
+            return
+        except Exception as e:  # pragma: no cover - runtime path
+            logger.exception("Compare failed for owner=%s", job.owner_id)
+            job.status = "error"
+            job.message = f"{type(e).__name__}: {e}"
+            self._mirror(job.id, status="error", stage=job.message)
+            return
+
+        try:
+            rid = db.add_report(job.owner_id, job.query, html, origin="compare")
+            job.report_id = rid
+            job.status = "done"
+            job.progress = 1.0
+            job.stage = "Готово"
+            job.message = "Готово."
+            self._mirror(
+                job.id, status="done", stage="Готово", progress=1.0, report_id=rid
+            )
+        except Exception as e:  # pragma: no cover
+            logger.exception("Failed to store compare report for owner=%s", job.owner_id)
             job.status = "error"
             job.message = f"Не удалось сохранить отчёт: {e}"
             self._mirror(job.id, status="error", stage="Ошибка сохранения")

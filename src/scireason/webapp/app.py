@@ -24,7 +24,7 @@ def create_app():
         ) from e
 
     from .deps import current_user, render
-    from .routes import account, auth, dashboard, pipeline, reports
+    from .routes import account, auth, compare, dashboard, pipeline, reports
 
     app = FastAPI(
         title="rootpaper — сайт",
@@ -49,6 +49,7 @@ def create_app():
     app.include_router(auth.router)
     app.include_router(reports.router)
     app.include_router(pipeline.router)
+    app.include_router(compare.router)
     app.include_router(dashboard.router)
     app.include_router(account.router)
 
